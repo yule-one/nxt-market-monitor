@@ -2,6 +2,10 @@
 
 KIND의 시장조치 공시와 넥스트레이드(NXT)의 날짜별 정규시장 거래현황 및 편입·편출 내역을 결합해 조회하는 Streamlit 앱입니다.
 
+## 웹 접속
+
+- [NXT 시장조치 모니터](https://nxt-market-monitor.streamlit.app/)
+
 ## 화면
 
 1. **KRX 시장조치 조회**
