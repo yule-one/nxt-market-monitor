@@ -65,6 +65,7 @@ st.markdown(
         font-size: 2.25rem;
         line-height: 1.2;
       }
+      button[aria-label="Download as CSV"] { display: none !important; }
       div[data-testid="stDataFrame"] { border-radius: 10px; }
     </style>
     """,
