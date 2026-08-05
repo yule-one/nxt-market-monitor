@@ -292,29 +292,70 @@ def _render_metric_card(label: str, value: str, tooltip: str | None = None) -> N
     )
 
 
+def _selected_disclosure_categories(selected_labels: list[str] | None) -> list[str]:
+    if not selected_labels or "전체" in selected_labels:
+        return list(CATEGORY_CODES)
+    return [category for category in CATEGORY_CODES if category in selected_labels]
+
+
+def _normalize_disclosure_category_selection() -> None:
+    current = list(st.session_state.get("disclosure_category", []))
+    previous = list(
+        st.session_state.get("_disclosure_category_previous", ["전체"])
+    )
+    if "전체" in current and len(current) > 1:
+        current = (
+            ["전체"]
+            if "전체" not in previous
+            else [item for item in current if item != "전체"]
+        )
+    if not current:
+        current = ["전체"]
+    st.session_state["disclosure_category"] = current
+    st.session_state["_disclosure_category_previous"] = current
+
+
 def disclosure_page() -> None:
-    st.title("NXT종목의 KRX 시장조치 현황")
-    st.caption("일자별 NXT종목의 KRX 시장조치 공시를 조회합니다.")
+    st.title("NXT 정규시장 종목의 KRX 시장조치 현황")
+    st.caption("일자별 NXT 정규시장 종목의 KRX 시장조치 공시를 조회합니다.")
     force_refresh = _refresh_control("refresh_disclosures")
     start_date, end_date = _date_controls("disclosure", default_days=0)
-    selected_label = st.pills(
+    selected_labels = st.pills(
         "공시 구분",
         ["전체", *CATEGORY_CODES.keys()],
-        default="전체",
-        selection_mode="single",
+        default=["전체"],
+        selection_mode="multi",
         key="disclosure_category",
+        on_change=_normalize_disclosure_category_selection,
     )
-    categories = list(CATEGORY_CODES) if selected_label in (None, "전체") else [selected_label]
+    query_clicked = st.button(
+        "조회",
+        type="primary",
+        key="disclosure_query_button",
+    )
+    query_state_key = "disclosure_applied_query"
+    if query_clicked or query_state_key not in st.session_state:
+        categories = _selected_disclosure_categories(selected_labels)
+        st.session_state[query_state_key] = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "categories": categories,
+        }
+    applied_query = st.session_state[query_state_key]
+    query_start_date = applied_query["start_date"]
+    query_end_date = applied_query["end_date"]
+    categories = applied_query["categories"]
+    query_all_categories = set(categories) == set(CATEGORY_CODES)
 
     with st.spinner("KIND 공시와 NXT 일자별 유니버스를 조회하고 있습니다..."):
         statuses_by_date, nxt_ssl = load_nxt_trading_statuses(
-            start_date,
-            end_date,
+            query_start_date,
+            query_end_date,
             force_refresh,
         )
         disclosures, kind_ssl = load_kind_disclosures(
-            start_date,
-            end_date,
+            query_start_date,
+            query_end_date,
             categories,
             force_refresh,
         )
@@ -357,8 +398,11 @@ def disclosure_page() -> None:
 
     _render_disclosure_table(frame)
     if not frame.empty:
-        _download_buttons(frame, f"nxt_kind_disclosures_{start_date}_{end_date}")
-    if SHOW_CHARTS and selected_label in (None, "전체") and not frame.empty:
+        _download_buttons(
+            frame,
+            f"nxt_kind_disclosures_{query_start_date}_{query_end_date}",
+        )
+    if SHOW_CHARTS and query_all_categories and not frame.empty:
         counts = (
             frame.groupby("구분")["종목코드"]
             .nunique()
@@ -382,7 +426,7 @@ def disclosure_page() -> None:
 
 
 def nxt_stocks_page() -> None:
-    st.title("일자별 NXT종목 현황")
+    st.title("NXT 정규시장 종목 현황")
     force_refresh = _refresh_control("refresh_nxt_stocks")
     as_of = st.date_input(
         "기준일",
@@ -463,7 +507,7 @@ def nxt_stocks_page() -> None:
 
 
 def nxt_changes_page() -> None:
-    st.title("NXT종목 변동내역")
+    st.title("NXT 정규시장 종목 변동내역")
     force_refresh = _refresh_control("refresh_nxt_changes")
     start_date, end_date = _date_controls("nxt_changes", default_days=30)
 
@@ -548,11 +592,10 @@ def nxt_changes_page() -> None:
     with st.expander("지표 정의"):
         st.markdown(
             """
-            - **NXT 종목수**: 해당 일자 NXT 정규시장 거래현황에 포함된 고유 종목 수입니다. 거래불가 종목도 NXT 현황에 포함돼 있으면 집계합니다.
-            - **조회기간 편입·편출종목수**: 선택한 조회기간에 편입 또는 편출된 고유 종목 수입니다.
-            - **당일 편입·편출 종목수**: 해당 일자에 발생한 변동별 고유 종목 수입니다.
-            - **NXT 종목수 증감**: 선택 기간 첫 거래일과 마지막 거래일의 공식 NXT 종목수 차이입니다.
-            - 편입·편출 변동내역과 날짜별 거래현황은 NXT가 독립적으로 제공하는 원천이므로, 변동 건수의 단순 차감과 NXT 종목수 증감은 일치하지 않을 수 있습니다.
+            - **NXT 종목수**: 해당 일자 NXT 정규시장 종목 수입니다. 거래불가 종목도 포함
+            - **조회기간 편입·편출종목수**: 선택한 조회기간에 편입 또는 편출된 종목 수
+            - **편입·편출 종목수**: 해당 일자에 발생한 편입·편출 종목 수
+            - **NXT 종목수 증감**: 조회기간의 첫 거래일과 마지막 거래일의 NXT 종목수 차이
             """
         )
 
@@ -706,8 +749,8 @@ def krx_market_actions_page() -> None:
 def main() -> None:
     pages = [
         st.Page(disclosure_page, title="KRX 시장조치 조회", icon="📋", default=True),
-        st.Page(nxt_stocks_page, title="일자별 NXT종목 현황", icon="🗓️"),
-        st.Page(nxt_changes_page, title="NXT종목 변동내역", icon="🔄"),
+        st.Page(nxt_stocks_page, title="NXT 정규시장 종목 현황", icon="🗓️"),
+        st.Page(nxt_changes_page, title="NXT 정규시장 종목 변동내역", icon="🔄"),
     ]
     navigation = st.navigation(pages)
     navigation.run()
