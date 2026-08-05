@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from html import escape
-from io import BytesIO
 
 import pandas as pd
 import plotly.express as px
@@ -19,10 +18,7 @@ from src.analytics import (
 from src.cache import ResponseCache
 from src.config import (
     CATEGORY_CODES,
-    KIND_SEARCH_MAIN_URL,
-    NXT_CHANGE_PAGE_URL,
     NXT_LAUNCH_DATE,
-    NXT_TRADING_STATUS_PAGE_URL,
     STATE_CATEGORIES,
 )
 from src.kind_client import KindClient
@@ -48,15 +44,6 @@ st.markdown(
         border-color: color-mix(in srgb, var(--text-color) 18%, transparent);
         border-radius: 12px;
         padding: 14px 16px;
-      }
-      .source-note {
-        color: var(--text-color);
-        font-size: 0.85rem;
-        opacity: 0.72;
-      }
-      .source-note a {
-        color: var(--primary-color);
-        font-weight: 600;
       }
       .hover-metric {
         background: var(--secondary-background-color);
@@ -178,30 +165,6 @@ def _show_ssl_warning(used: bool) -> None:
         )
 
 
-def _download_buttons(frame: pd.DataFrame, filename_prefix: str) -> None:
-    csv_bytes = frame.to_csv(index=False).encode("utf-8-sig")
-    excel_buffer = BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-        frame.to_excel(writer, index=False, sheet_name="data")
-    col1, col2, _ = st.columns([1, 1, 4])
-    with col1:
-        st.download_button(
-            "CSV 다운로드",
-            data=csv_bytes,
-            file_name=f"{filename_prefix}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with col2:
-        st.download_button(
-            "Excel 다운로드",
-            data=excel_buffer.getvalue(),
-            file_name=f"{filename_prefix}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-
 def _render_disclosure_table(frame: pd.DataFrame) -> None:
     if frame.empty:
         st.info("선택한 조건에 해당하는 NXT 관련 공시가 없습니다.")
@@ -230,8 +193,8 @@ def _style_daily_nxt_metrics(frame: pd.DataFrame):
     return (
         frame.style.format(
             {
-                "당일 편입 종목수": format_addition,
-                "당일 편출 종목수": format_exclusion,
+                "편입 종목수": format_addition,
+                "편출 종목수": format_exclusion,
             }
         )
         .map(
@@ -240,7 +203,7 @@ def _style_daily_nxt_metrics(frame: pd.DataFrame):
                 if value > 0
                 else ""
             ),
-            subset=pd.IndexSlice[:, ["당일 편입 종목수"]],
+            subset=pd.IndexSlice[:, ["편입 종목수"]],
         )
         .map(
             lambda value: (
@@ -248,7 +211,7 @@ def _style_daily_nxt_metrics(frame: pd.DataFrame):
                 if value > 0
                 else ""
             ),
-            subset=pd.IndexSlice[:, ["당일 편출 종목수"]],
+            subset=pd.IndexSlice[:, ["편출 종목수"]],
         )
     )
 
@@ -293,54 +256,39 @@ def _render_metric_card(label: str, value: str, tooltip: str | None = None) -> N
 
 
 def _selected_disclosure_categories(selected_labels: list[str] | None) -> list[str]:
-    if not selected_labels or "전체" in selected_labels:
-        return list(CATEGORY_CODES)
-    return [category for category in CATEGORY_CODES if category in selected_labels]
-
-
-def _normalize_disclosure_category_selection() -> None:
-    current = list(st.session_state.get("disclosure_category", []))
-    previous = list(
-        st.session_state.get("_disclosure_category_previous", ["전체"])
-    )
-    if "전체" in current and len(current) > 1:
-        current = (
-            ["전체"]
-            if "전체" not in previous
-            else [item for item in current if item != "전체"]
-        )
-    if not current:
-        current = ["전체"]
-    st.session_state["disclosure_category"] = current
-    st.session_state["_disclosure_category_previous"] = current
+    selected_specific = [
+        category for category in CATEGORY_CODES if category in (selected_labels or [])
+    ]
+    return selected_specific or list(CATEGORY_CODES)
 
 
 def disclosure_page() -> None:
     st.title("NXT 정규시장 종목의 KRX 시장조치 현황")
-    st.caption("일자별 NXT 정규시장 종목의 KRX 시장조치 공시를 조회합니다.")
     force_refresh = _refresh_control("refresh_disclosures")
-    start_date, end_date = _date_controls("disclosure", default_days=0)
-    selected_labels = st.pills(
-        "공시 구분",
-        ["전체", *CATEGORY_CODES.keys()],
-        default=["전체"],
-        selection_mode="multi",
-        key="disclosure_category",
-        on_change=_normalize_disclosure_category_selection,
-    )
-    query_clicked = st.button(
-        "조회",
-        type="primary",
-        key="disclosure_query_button",
-    )
-    query_state_key = "disclosure_applied_query"
-    if query_clicked or query_state_key not in st.session_state:
+    with st.form("disclosure_query_form"):
+        start_date, end_date = _date_controls("disclosure", default_days=0)
+        selected_labels = st.pills(
+            "공시 구분",
+            ["전체", *CATEGORY_CODES.keys()],
+            default=["전체"],
+            selection_mode="multi",
+            key="disclosure_category",
+        )
+        query_clicked = st.form_submit_button(
+            "조회",
+            type="primary",
+        )
+    query_state_key = "disclosure_applied_query_v2"
+    if query_clicked:
         categories = _selected_disclosure_categories(selected_labels)
         st.session_state[query_state_key] = {
             "start_date": start_date,
             "end_date": end_date,
             "categories": categories,
         }
+    if query_state_key not in st.session_state:
+        st.info("조회 조건을 선택한 후 조회 버튼을 눌러주세요.")
+        return
     applied_query = st.session_state[query_state_key]
     query_start_date = applied_query["start_date"]
     query_end_date = applied_query["end_date"]
@@ -397,11 +345,6 @@ def disclosure_page() -> None:
     )
 
     _render_disclosure_table(frame)
-    if not frame.empty:
-        _download_buttons(
-            frame,
-            f"nxt_kind_disclosures_{query_start_date}_{query_end_date}",
-        )
     if SHOW_CHARTS and query_all_categories and not frame.empty:
         counts = (
             frame.groupby("구분")["종목코드"]
@@ -418,13 +361,6 @@ def disclosure_page() -> None:
             showlegend=False, margin=dict(l=10, r=10, t=50, b=10)
         )
         st.plotly_chart(chart, use_container_width=True)
-    st.markdown(
-        f'<p class="source-note">출처: <a href="{KIND_SEARCH_MAIN_URL}">KIND 상세검색</a>, '
-        f'<a href="{NXT_TRADING_STATUS_PAGE_URL}">NXT 정규시장 거래현황</a></p>',
-        unsafe_allow_html=True,
-    )
-
-
 def nxt_stocks_page() -> None:
     st.title("NXT 정규시장 종목 현황")
     force_refresh = _refresh_control("refresh_nxt_stocks")
@@ -489,8 +425,6 @@ def nxt_stocks_page() -> None:
         display = display.loc[mask]
 
     st.dataframe(display, hide_index=True, use_container_width=True, height=650)
-    if not display.empty:
-        _download_buttons(display, f"nxt_stocks_{as_of}")
 
     day_changes = [item for item in changes if item.change_date == as_of]
     with st.expander(f"{as_of:%Y-%m-%d} 종목 변동내역 ({len(day_changes):,}건)", expanded=False):
@@ -499,13 +433,6 @@ def nxt_stocks_page() -> None:
             st.info("해당 일자의 편입·편출 내역이 없습니다.")
         else:
             st.dataframe(change_frame, hide_index=True, use_container_width=True)
-    st.markdown(
-        f'<p class="source-note">출처: <a href="{NXT_TRADING_STATUS_PAGE_URL}">NXT 정규시장 거래현황</a>, '
-        f'<a href="{NXT_CHANGE_PAGE_URL}">NXT 매매체결종목 변동내역</a></p>',
-        unsafe_allow_html=True,
-    )
-
-
 def nxt_changes_page() -> None:
     st.title("NXT 정규시장 종목 변동내역")
     force_refresh = _refresh_control("refresh_nxt_changes")
@@ -577,26 +504,19 @@ def nxt_changes_page() -> None:
                 use_container_width=True,
                 height=650,
             )
-            _download_buttons(change_frame, f"nxt_changes_{start_date}_{end_date}")
 
     with summary_tab:
-        summary_frame = metrics.sort_values("일자", ascending=False)
+        summary_frame = metrics.sort_values("일자", ascending=False).rename(
+            columns={
+                "당일 편입 종목수": "편입 종목수",
+                "당일 편출 종목수": "편출 종목수",
+            }
+        )
         st.dataframe(
             _style_daily_nxt_metrics(summary_frame),
             hide_index=True,
             use_container_width=True,
             height=650,
-        )
-        _download_buttons(metrics, f"nxt_daily_changes_{start_date}_{end_date}")
-
-    with st.expander("지표 정의"):
-        st.markdown(
-            """
-            - **NXT 종목수**: 해당 일자 NXT 정규시장 종목 수입니다. 거래불가 종목도 포함
-            - **조회기간 편입·편출종목수**: 선택한 조회기간에 편입 또는 편출된 종목 수
-            - **편입·편출 종목수**: 해당 일자에 발생한 편입·편출 종목 수
-            - **NXT 종목수 증감**: 조회기간의 첫 거래일과 마지막 거래일의 NXT 종목수 차이
-            """
         )
 
     if SHOW_CHARTS:
@@ -625,13 +545,6 @@ def nxt_changes_page() -> None:
             hovermode="x unified", margin=dict(l=10, r=10, t=50, b=10)
         )
         st.plotly_chart(state_chart, use_container_width=True)
-    st.markdown(
-        f'<p class="source-note">출처: <a href="{NXT_TRADING_STATUS_PAGE_URL}">NXT 정규시장 거래현황</a>, '
-        f'<a href="{NXT_CHANGE_PAGE_URL}">NXT 매매체결종목 변동내역</a></p>',
-        unsafe_allow_html=True,
-    )
-
-
 def krx_market_actions_page() -> None:
     st.title("KRX 시장조치")
     st.caption("각 일자의 NXT 공식 거래현황 종목에 한정해 KRX 시장조치 상태와 공시 수를 조회합니다.")
@@ -708,9 +621,6 @@ def krx_market_actions_page() -> None:
             use_container_width=True,
             height=650,
         )
-        _download_buttons(
-            status_frame, f"krx_market_actions_{start_date}_{end_date}"
-        )
 
     with disclosure_tab:
         period_matched = [
@@ -723,27 +633,6 @@ def krx_market_actions_page() -> None:
         if not disclosure_frame.empty:
             disclosure_frame = disclosure_frame.sort_values("공시일시", ascending=False)
         _render_disclosure_table(disclosure_frame)
-        if not disclosure_frame.empty:
-            _download_buttons(
-                disclosure_frame, f"krx_action_disclosures_{start_date}_{end_date}"
-            )
-
-    with st.expander("지표 정의와 데이터 유의사항"):
-        st.markdown(
-            """
-            - **NXT 대상 범위**: 각 일자 NXT 정규시장 거래현황에 실제로 포함된 종목입니다. 과거 편입·편출 이력으로 추정하지 않습니다.
-            - **거래정지·관리·환기·단기과열 종목수**: 해당 일자 NXT 원본의 `거래불가사유`로 집계합니다. 과거 공시를 누적하지 않습니다.
-            - **투자경고·투자위험 종목수**: KIND가 제공하는 공식 지정일·해제일 기간을 해당 일자 NXT 종목과 교차합니다.
-            - **당일공시** 열: 상태 누계가 아니라 해당 일자에 공시가 발생한 고유 NXT 관련 종목 수입니다.
-            - 공시 제목만으로 효력일을 구분하기 어려운 `정지및정지해제` 문서는 세부 본문의 정지일·해제일을 사용합니다. 그 밖의 공시는 제목상 지정·해제를 공시일 기준으로 반영합니다.
-            - 우선주를 대상으로 한 시장조치가 대표 보통주 코드에 잘못 결합되지 않도록 별도 제외합니다.
-            """
-        )
-    st.markdown(
-        f'<p class="source-note">출처: <a href="{KIND_SEARCH_MAIN_URL}">KIND 상세검색</a>, '
-        f'<a href="{NXT_TRADING_STATUS_PAGE_URL}">NXT 정규시장 거래현황</a></p>',
-        unsafe_allow_html=True,
-    )
 
 
 def main() -> None:
