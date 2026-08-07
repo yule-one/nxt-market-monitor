@@ -288,6 +288,67 @@ def test_historical_store_round_trips_nxt_limit_proximity_times(
     ] == "080600"
 
 
+def test_historical_store_materializes_limit_proximity_hits(tmp_path: Path) -> None:
+    store = HistoricalMarketStore(tmp_path / "history.db")
+    trading_date = date(2026, 8, 6)
+    statuses, _snapshot_data = _snapshot(trading_date)
+    statuses.append(
+        NxtTradingStatus(
+            status_date=trading_date,
+            stock_code="051360",
+            stock_name="토비스",
+            market="KOSDAQ",
+            tradable_market="NXT",
+            unavailable_reason="",
+            reference_price=10_000,
+            current_price=11_000,
+            cumulative_volume=1_000,
+            cumulative_amount=11_000_000,
+            open_price=10_100,
+            high_price=12_990,
+            low_price=10_000,
+            upper_limit_price=13_000,
+            lower_limit_price=7_000,
+        )
+    )
+
+    store.save_nxt_statuses(trading_date, statuses)
+    hits = {
+        (item.stock_code, item.direction): item
+        for item in store.load_nxt_limit_proximity_hits(trading_date)
+    }
+
+    assert hits[("005930", "상한가")].distance_ticks == 0
+    assert hits[("051360", "상한가")].distance_ticks == 1
+    assert hits[("051360", "상한가")].closest_price == 12_990
+    with store._connect() as connection:
+        daily = connection.execute(
+            "SELECT * FROM nxt_limit_proximity_daily WHERE trade_date = ?",
+            (trading_date.isoformat(),),
+        ).fetchone()
+    assert daily["upper_exact_count"] == 1
+    assert daily["upper_near_count"] == 1
+    assert daily["lower_exact_count"] == 0
+    assert daily["lower_near_count"] == 0
+
+
+def test_rebuild_nxt_limit_proximity_hits_restores_all_dates(tmp_path: Path) -> None:
+    store = HistoricalMarketStore(tmp_path / "history.db")
+    first_date = date(2026, 8, 5)
+    second_date = date(2026, 8, 6)
+    for trading_date in (first_date, second_date):
+        statuses, _snapshot_data = _snapshot(trading_date)
+        store.save_nxt_statuses(trading_date, statuses)
+    with store._connect() as connection:
+        connection.execute("DELETE FROM nxt_limit_proximity_hits")
+
+    assert store.rebuild_nxt_limit_proximity_hits(first_date, second_date) == 2
+    coverage = store.nxt_limit_proximity_hit_coverage()
+    assert coverage["trading_days"] == 2
+    assert coverage["first_date"] == first_date
+    assert coverage["last_date"] == second_date
+
+
 def test_historical_store_materializes_and_updates_nxt_limit_hits(
     tmp_path: Path,
 ) -> None:

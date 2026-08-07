@@ -64,7 +64,7 @@ from src.nxt_change_store import (
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 7
-HISTORICAL_STORE_RUNTIME_VERSION = 9
+HISTORICAL_STORE_RUNTIME_VERSION = 10
 NXT_LIMIT_PROXIMITY_TICKS = 3
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
@@ -253,6 +253,9 @@ st.markdown(
         grid-template-columns: repeat(4, minmax(0, 1fr));
         margin: 0.2rem 0 0.8rem;
       }
+      .limit-summary-strip-six {
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+      }
       .limit-summary-item {
         background: var(--secondary-background-color);
         border: 1px solid rgba(128, 128, 128, 0.24);
@@ -325,6 +328,9 @@ st.markdown(
         text-align: center !important;
         width: 100% !important;
       }
+      @media (max-width: 1200px) {
+        .limit-summary-strip-six { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      }
       @media (max-width: 900px) {
         .compact-status-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .limit-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -363,6 +369,7 @@ def get_historical_market_store() -> HistoricalMarketStore:
         for method_name in (
             "nxt_limit_hit_coverage",
             "load_nxt_limit_proximity_times",
+            "load_nxt_limit_proximity_hits",
         )
     ):
         _get_historical_market_store.clear()
@@ -2650,12 +2657,14 @@ def _render_limit_proximity_summary(
         frame[["시가", "고가", "저가", "종가"]].notna().all(axis=1).sum()
     )
 
-    def direction_count(direction: str) -> int:
+    def direction_count(direction: str, *, exact: bool) -> int:
         if proximity_rows.empty:
             return 0
+        distances = pd.to_numeric(proximity_rows["잔여틱"], errors="coerce")
+        distance_mask = distances.eq(0) if exact else distances.between(1, 3)
         return int(
             proximity_rows.loc[
-                proximity_rows["근접구분"] == direction,
+                (proximity_rows["근접구분"] == direction) & distance_mask,
                 "종목코드",
             ].nunique()
         )
@@ -2667,8 +2676,18 @@ def _render_limit_proximity_summary(
             f"{ohlc_count:,}",
             "시가·고가·저가·종가 값이 모두 수록된 종목 수입니다.",
         ),
-        ("상한가 근접 종목수", f"{direction_count('상한가'):,}종목", None),
-        ("하한가 근접 종목수", f"{direction_count('하한가'):,}종목", None),
+        ("상한가 종목수", f"{direction_count('상한가', exact=True):,}종목", None),
+        ("하한가 종목수", f"{direction_count('하한가', exact=True):,}종목", None),
+        (
+            "상한가 근접 종목수",
+            f"{direction_count('상한가', exact=False):,}종목",
+            None,
+        ),
+        (
+            "하한가 근접 종목수",
+            f"{direction_count('하한가', exact=False):,}종목",
+            None,
+        ),
     ]
     summary_html = "".join(
         '<div class="limit-summary-item"'
@@ -2680,7 +2699,8 @@ def _render_limit_proximity_summary(
         for label, value, tooltip in summary_items
     )
     st.markdown(
-        f'<div class="limit-summary-strip">{summary_html}</div>',
+        f'<div class="limit-summary-strip limit-summary-strip-six">'
+        f"{summary_html}</div>",
         unsafe_allow_html=True,
     )
 
