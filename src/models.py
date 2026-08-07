@@ -37,6 +37,18 @@ class NxtTradingStatus:
     tradable_market: str
     unavailable_reason: str
     isin: str = ""
+    reference_price: int | None = None
+    current_price: int | None = None
+    change_value: int | None = None
+    change_rate: float | None = None
+    cumulative_volume: int = 0
+    cumulative_amount: int = 0
+    quote_time: str = ""
+    open_price: int | None = None
+    high_price: int | None = None
+    low_price: int | None = None
+    upper_limit_price: int | None = None
+    lower_limit_price: int | None = None
 
     @property
     def is_unavailable(self) -> bool:

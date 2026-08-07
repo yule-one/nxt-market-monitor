@@ -4,6 +4,19 @@ from src.kind_client import KindClient, normalize_kind_code
 from src.nxt_client import NxtClient, normalize_stock_code
 
 
+class TrackingCache:
+    def __init__(self, payload: object) -> None:
+        self.payload = payload
+        self.max_age: object = "not-called"
+
+    def get(self, _source: str, _key: str, max_age: object = None) -> object:
+        self.max_age = max_age
+        return self.payload
+
+    def set(self, _source: str, _key: str, _payload: object) -> None:
+        raise AssertionError("cached payload should be reused")
+
+
 def test_normalize_stock_codes() -> None:
     assert normalize_kind_code("40349") == "403490"
     assert normalize_kind_code("005930") == "005930"
@@ -59,6 +72,16 @@ def test_parse_nxt_trading_status() -> None:
             "cptrTrdPmsnCdNm": "거래불가",
             "trdIpsbRsn": "거래정지",
             "isuCd": "KR7036800000",
+            "basePrc": "42000",
+            "curPrc": 44100,
+            "contrastPrc": 2100,
+            "upDownRate": 5.0,
+            "accTdQty": 123456,
+            "accTrval": 5432100000,
+            "creTime": "200500",
+            "oppr": 42_100,
+            "hgpr": 54_600,
+            "lwpr": 41_500,
         }
     )
     assert parsed is not None
@@ -66,6 +89,35 @@ def test_parse_nxt_trading_status() -> None:
     assert parsed.stock_code == "036800"
     assert parsed.tradable_market == "거래불가"
     assert parsed.unavailable_reason == "거래정지"
+    assert parsed.reference_price == 42_000
+    assert parsed.current_price == 44_100
+    assert parsed.change_value == 2_100
+    assert parsed.change_rate == 0.05
+    assert parsed.cumulative_volume == 123_456
+    assert parsed.cumulative_amount == 5_432_100_000
+    assert parsed.quote_time == "200500"
+    assert parsed.open_price == 42_100
+    assert parsed.high_price == 54_600
+    assert parsed.low_price == 41_500
+    assert parsed.upper_limit_price == 54_600
+    assert parsed.lower_limit_price == 29_400
+
+
+def test_past_nxt_trading_status_is_reused_without_expiration() -> None:
+    cached_row = {
+        "status_date": "2025-03-04",
+        "stock_code": "005930",
+        "stock_name": "삼성전자",
+        "market": "KOSPI",
+        "tradable_market": "NXT",
+        "unavailable_reason": "",
+    }
+    cache = TrackingCache([cached_row])
+
+    rows = NxtClient(cache).fetch_trading_status(date(2025, 3, 4))  # type: ignore[arg-type]
+
+    assert cache.max_age is None
+    assert rows[0].stock_code == "005930"
 
 
 def test_parse_investment_status_period() -> None:
