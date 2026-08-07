@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -186,6 +187,30 @@ def test_historical_store_round_trips_nxt_session_quotes(tmp_path: Path) -> None
     loaded = store.load_nxt_session_quotes(trading_date, "PRE")
 
     assert loaded == [quote]
+
+
+def test_historical_store_restores_compressed_seed(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.db"
+    source_store = HistoricalMarketStore(source_path)
+    trading_date = date(2026, 8, 6)
+    statuses, snapshot = _snapshot(trading_date)
+    source_store.save_historical_snapshot(trading_date, statuses, snapshot)
+
+    seed_path = tmp_path / "history.db.gz"
+    with source_store._connect() as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    with source_path.open("rb") as source, gzip.open(seed_path, "wb") as target:
+        target.write(source.read())
+    restored_path = tmp_path / "restored" / "history.db"
+
+    restored_store = HistoricalMarketStore(
+        restored_path,
+        seed_path=seed_path,
+    )
+
+    assert restored_path.exists()
+    assert restored_store.snapshot_dates() == {trading_date}
+    assert len(restored_store.load_nxt_statuses(trading_date)) == 2
 
 
 def test_historical_store_round_trips_nxt_limit_hit_times(tmp_path: Path) -> None:

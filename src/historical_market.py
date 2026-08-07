@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import gzip
+import os
+import shutil
 import sqlite3
+import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
@@ -178,12 +182,44 @@ def _weighted_nxt_change_rate(
 class HistoricalMarketStore:
     """NXT 대상 종목의 과거 대시보드 데이터와 일별 합계를 저장합니다."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        seed_path: Path | None = None,
+    ) -> None:
         project_root = Path(__file__).resolve().parents[1]
         self.path = path or project_root / "data" / "history.db"
+        self.seed_path = (
+            seed_path
+            if seed_path is not None
+            else project_root / "data" / "history.db.gz"
+            if path is None
+            else None
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._restore_seed_if_needed()
         self._lock = threading.RLock()
         self._initialize()
+
+    def _restore_seed_if_needed(self) -> None:
+        if self.path.exists() or self.seed_path is None or not self.seed_path.exists():
+            return
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=self.path.parent,
+                prefix=".history-restore-",
+                suffix=".db",
+                delete=False,
+            ) as target:
+                temporary_path = Path(target.name)
+                with gzip.open(self.seed_path, "rb") as source:
+                    shutil.copyfileobj(source, target)
+            os.replace(temporary_path, self.path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
