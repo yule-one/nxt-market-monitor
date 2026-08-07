@@ -3,6 +3,7 @@ from datetime import date, datetime
 from src.analytics import (
     build_daily_metrics,
     build_daily_nxt_metrics,
+    build_daily_nxt_metrics_from_counts,
     build_nxt_state_as_of,
     disclosures_to_frame,
     extract_state_transitions,
@@ -241,6 +242,29 @@ def test_daily_nxt_metrics_separates_state_and_daily_flow() -> None:
     assert excluded_day["당일 편출 종목수"] == 1
     assert following_day["NXT 종목수"] == 1
     assert following_day["당일 편출 종목수"] == 0
+
+
+def test_daily_nxt_metrics_uses_stored_stock_counts() -> None:
+    events = [
+        nxt_change(date(2025, 3, 5), "123450", "편출", "관리종목지정"),
+    ]
+
+    metrics = build_daily_nxt_metrics_from_counts(
+        events,
+        {
+            date(2025, 3, 4): 590,
+            date(2025, 3, 5): 589,
+        },
+        date(2025, 3, 4),
+        date(2025, 3, 5),
+    )
+
+    first = metrics.loc[metrics["일자"] == date(2025, 3, 4)].iloc[0]
+    second = metrics.loc[metrics["일자"] == date(2025, 3, 5)].iloc[0]
+    assert first["NXT 종목수"] == 590
+    assert first["당일 편출 종목수"] == 0
+    assert second["NXT 종목수"] == 589
+    assert second["당일 편출 종목수"] == 1
 
 
 def test_daily_metrics_uses_official_warning_period() -> None:

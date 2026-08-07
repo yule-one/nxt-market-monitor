@@ -360,6 +360,49 @@ def build_daily_nxt_metrics(
     return pd.DataFrame.from_records(records)
 
 
+def build_daily_nxt_metrics_from_counts(
+    changes: Sequence[NxtChange],
+    stock_counts_by_date: Mapping[date, int],
+    start_date: date,
+    end_date: date,
+) -> pd.DataFrame:
+    """저장된 일별 NXT 종목수와 변동내역만으로 화면 집계를 만듭니다."""
+
+    if end_date < start_date:
+        return pd.DataFrame()
+    changes_by_date: dict[date, list[NxtChange]] = defaultdict(list)
+    for change in changes:
+        if start_date <= change.change_date <= end_date:
+            changes_by_date[change.change_date].append(change)
+
+    records = []
+    for current_date in sorted(stock_counts_by_date):
+        if not start_date <= current_date <= end_date:
+            continue
+        daily_changes = changes_by_date.get(current_date, [])
+        records.append(
+            {
+                "일자": current_date,
+                "NXT 종목수": int(stock_counts_by_date[current_date]),
+                "당일 편입 종목수": len(
+                    {
+                        item.stock_code
+                        for item in daily_changes
+                        if item.change_type == "편입"
+                    }
+                ),
+                "당일 편출 종목수": len(
+                    {
+                        item.stock_code
+                        for item in daily_changes
+                        if item.change_type == "편출"
+                    }
+                ),
+            }
+        )
+    return pd.DataFrame.from_records(records)
+
+
 def build_daily_metrics(
     matched_disclosures: Sequence[dict],
     statuses_by_date: Mapping[date, Sequence[NxtTradingStatus]],
