@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from math import isfinite
 
 
 PRICE_POINT_FIELDS = (
@@ -28,6 +29,140 @@ def stock_tick_size(price: int, market: str = "") -> int:
     if price < 500_000:
         return 500
     return 1_000
+
+
+def move_stock_price_ticks(
+    price: int,
+    ticks: int,
+    market: str = "",
+) -> int:
+    """가격대 경계를 반영해 유효 호가를 ``ticks``칸 이동합니다."""
+
+    current = int(price)
+    if current <= 0:
+        raise ValueError("양수 가격이 필요합니다.")
+    if ticks > 0:
+        for _ in range(ticks):
+            current += stock_tick_size(current, market)
+    else:
+        for _ in range(-ticks):
+            if current <= 1:
+                return 0
+            current -= stock_tick_size(current - 1, market)
+    return current
+
+
+def limit_proximity_ticks(
+    price: int | None,
+    limit_price: int | None,
+    direction: str,
+    *,
+    max_ticks: int = 3,
+    market: str = "",
+) -> int | None:
+    """상·하한가에서 몇 호가 이내인지 반환하고 범위 밖이면 ``None``을 반환합니다."""
+
+    if price is None or limit_price is None or max_ticks < 0:
+        return None
+    try:
+        price_number = float(price)
+        limit_number = float(limit_price)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(price_number) or not isfinite(limit_number):
+        return None
+    value = int(price_number)
+    limit = int(limit_number)
+    if value <= 0 or limit <= 0:
+        return None
+    if direction == "상한가":
+        if value > limit:
+            return None
+        if value == limit:
+            return 0
+        for distance in range(1, max_ticks + 1):
+            if value >= move_stock_price_ticks(limit, -distance, market):
+                return distance
+        return None
+    if direction == "하한가":
+        if value < limit:
+            return None
+        if value == limit:
+            return 0
+        for distance in range(1, max_ticks + 1):
+            if value <= move_stock_price_ticks(limit, distance, market):
+                return distance
+        return None
+    raise ValueError(f"지원하지 않는 상·하한가 구분입니다: {direction}")
+
+
+def reached_limit_proximity_points(
+    *,
+    open_price: int | None,
+    high_price: int | None,
+    low_price: int | None,
+    close_price: int | None,
+    limit_price: int | None,
+    direction: str,
+    max_ticks: int = 3,
+    market: str = "",
+) -> tuple[str, ...]:
+    """OHLC 중 상·하한가 ``max_ticks``호가 이내에 들어온 가격 항목을 반환합니다."""
+
+    values = (
+        ("시가", open_price),
+        ("고가", high_price),
+        ("저가", low_price),
+        ("종가", close_price),
+    )
+    return tuple(
+        label
+        for label, value in values
+        if limit_proximity_ticks(
+            value,
+            limit_price,
+            direction,
+            max_ticks=max_ticks,
+            market=market,
+        )
+        is not None
+    )
+
+
+def first_limit_proximity_time(
+    minute_prices: Iterable[
+        tuple[
+            str,
+            int | None,
+            int | None,
+            int | None,
+            int | None,
+        ]
+    ],
+    limit_price: int | None,
+    direction: str,
+    *,
+    max_ticks: int = 3,
+    market: str = "",
+) -> str | None:
+    """분봉 OHLC가 상·하한가 근접 범위에 처음 들어온 HHMMSS를 반환합니다."""
+
+    for trade_time, open_price, high_price, low_price, close_price in sorted(
+        minute_prices,
+        key=lambda item: item[0],
+    ):
+        if reached_limit_proximity_points(
+            open_price=open_price,
+            high_price=high_price,
+            low_price=low_price,
+            close_price=close_price,
+            limit_price=limit_price,
+            direction=direction,
+            max_ticks=max_ticks,
+            market=market,
+        ):
+            return trade_time
+    return None
 
 
 def calculate_stock_price_limits(

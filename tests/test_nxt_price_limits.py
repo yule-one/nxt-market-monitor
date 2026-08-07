@@ -1,7 +1,11 @@
 from src.nxt_price_limits import (
     calculate_stock_price_limits,
+    first_limit_proximity_time,
     first_limit_hit_time,
     format_limit_hit_time,
+    limit_proximity_ticks,
+    move_stock_price_ticks,
+    reached_limit_proximity_points,
     reached_limit_points,
     stock_tick_size,
 )
@@ -21,6 +25,50 @@ def test_price_limit_calculation_matches_krx_rounding_example() -> None:
     assert calculate_stock_price_limits(9_940, "KOSDAQ") == (12_920, 6_960)
     assert calculate_stock_price_limits(42_000, "KOSDAQ") == (54_600, 29_400)
     assert calculate_stock_price_limits(165_100, "KOSDAQ") == (214_500, 115_600)
+
+
+def test_move_stock_price_ticks_uses_each_crossed_price_band() -> None:
+    assert move_stock_price_ticks(5_000, -3) == 4_985
+    assert move_stock_price_ticks(5_000, 3) == 5_030
+    assert move_stock_price_ticks(20_000, -3) == 19_970
+    assert move_stock_price_ticks(20_000, 3) == 20_150
+
+
+def test_limit_proximity_ticks_includes_zero_through_three_ticks() -> None:
+    assert limit_proximity_ticks(5_000, 5_000, "상한가") == 0
+    assert limit_proximity_ticks(4_997, 5_000, "상한가") == 1
+    assert limit_proximity_ticks(4_986, 5_000, "상한가") == 3
+    assert limit_proximity_ticks(4_984, 5_000, "상한가") is None
+    assert limit_proximity_ticks(4_995, 4_995, "하한가") == 0
+    assert limit_proximity_ticks(4_998, 4_995, "하한가") == 1
+    assert limit_proximity_ticks(5_012, 4_995, "하한가") == 3
+    assert limit_proximity_ticks(5_021, 4_995, "하한가") is None
+    assert limit_proximity_ticks(float("nan"), 4_995, "하한가") is None
+    assert limit_proximity_ticks(5_000, float("nan"), "상한가") is None
+
+
+def test_reached_limit_proximity_points_checks_ohlc_range() -> None:
+    assert reached_limit_proximity_points(
+        open_price=4_970,
+        high_price=4_995,
+        low_price=4_960,
+        close_price=4_990,
+        limit_price=5_000,
+        direction="상한가",
+    ) == ("고가", "종가")
+
+
+def test_first_limit_proximity_time_uses_earliest_matching_minute() -> None:
+    minute_prices = [
+        ("091500", 4_980, 4_995, 4_975, 4_990),
+        ("081000", 4_970, 4_990, 4_960, 4_985),
+        ("080000", 4_950, 4_970, 4_940, 4_960),
+    ]
+
+    assert (
+        first_limit_proximity_time(minute_prices, 5_000, "상한가")
+        == "081000"
+    )
 
 
 def test_reached_limit_points_checks_each_ohlc_value() -> None:
