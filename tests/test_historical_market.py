@@ -213,6 +213,39 @@ def test_historical_store_restores_compressed_seed(tmp_path: Path) -> None:
     assert len(restored_store.load_nxt_statuses(trading_date)) == 2
 
 
+def test_historical_store_replaces_incomplete_database_with_seed(
+    tmp_path: Path,
+) -> None:
+    seed_source_path = tmp_path / "seed-source.db"
+    seed_source_store = HistoricalMarketStore(seed_source_path)
+    first_date = date(2026, 8, 5)
+    second_date = date(2026, 8, 6)
+    for trading_date in (first_date, second_date):
+        statuses, snapshot = _snapshot(trading_date)
+        seed_source_store.save_historical_snapshot(
+            trading_date,
+            statuses,
+            snapshot,
+        )
+    with seed_source_store._connect() as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    seed_path = tmp_path / "history.db.gz"
+    with seed_source_path.open("rb") as source, gzip.open(seed_path, "wb") as target:
+        target.write(source.read())
+
+    deployed_path = tmp_path / "deployed" / "history.db"
+    deployed_store = HistoricalMarketStore(deployed_path)
+    statuses, snapshot = _snapshot(second_date)
+    deployed_store.save_historical_snapshot(second_date, statuses, snapshot)
+
+    restored_store = HistoricalMarketStore(
+        deployed_path,
+        seed_path=seed_path,
+    )
+
+    assert restored_store.snapshot_dates() == {first_date, second_date}
+
+
 def test_historical_store_round_trips_nxt_limit_hit_times(tmp_path: Path) -> None:
     store = HistoricalMarketStore(tmp_path / "history.db")
     trading_date = date(2026, 8, 6)

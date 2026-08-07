@@ -203,7 +203,7 @@ class HistoricalMarketStore:
         self._initialize()
 
     def _restore_seed_if_needed(self) -> None:
-        if self.path.exists() or self.seed_path is None or not self.seed_path.exists():
+        if self.seed_path is None or not self.seed_path.exists():
             return
         temporary_path: Path | None = None
         try:
@@ -216,10 +216,65 @@ class HistoricalMarketStore:
                 temporary_path = Path(target.name)
                 with gzip.open(self.seed_path, "rb") as source:
                     shutil.copyfileobj(source, target)
-            os.replace(temporary_path, self.path)
+            seed_counts = self._database_table_counts(temporary_path)
+            current_counts = self._database_table_counts(self.path)
+            current_is_complete = bool(seed_counts) and bool(current_counts) and all(
+                current_counts.get(table_name, 0) >= seed_count
+                for table_name, seed_count in seed_counts.items()
+            )
+            if current_is_complete:
+                return
+            if self.path.exists():
+                self._replace_database_from_snapshot(temporary_path)
+            else:
+                os.replace(temporary_path, self.path)
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _database_table_counts(path: Path) -> dict[str, int]:
+        if not path.exists():
+            return {}
+        try:
+            connection = sqlite3.connect(
+                f"file:{path.resolve().as_posix()}?mode=ro",
+                uri=True,
+                timeout=5,
+            )
+            try:
+                table_names = [
+                    str(row[0])
+                    for row in connection.execute(
+                        """
+                        SELECT name
+                        FROM sqlite_master
+                        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                        """
+                    ).fetchall()
+                ]
+                return {
+                    table_name: int(
+                        connection.execute(
+                            f'SELECT COUNT(*) FROM "{table_name}"'
+                        ).fetchone()[0]
+                    )
+                    for table_name in table_names
+                }
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            return {}
+
+    def _replace_database_from_snapshot(self, snapshot_path: Path) -> None:
+        source = sqlite3.connect(snapshot_path, timeout=30)
+        target = sqlite3.connect(self.path, timeout=30)
+        try:
+            source.backup(target)
+            target.commit()
+        finally:
+            target.close()
+            source.close()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30)
