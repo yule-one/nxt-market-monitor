@@ -2711,13 +2711,13 @@ def _render_nxt_limit_proximity_table(proximity_rows: pd.DataFrame) -> None:
         "종목명",
         "상장시장",
         "상·하한가 근접 구분",
-        "기록시점",
+        "도달시점",
+        "잔여틱",
         "기준가격",
         "상한가",
         "하한가",
         "시가",
         "최근접가격",
-        "잔여틱",
         "종가",
     ]
     body_rows: list[str] = []
@@ -2727,19 +2727,20 @@ def _render_nxt_limit_proximity_table(proximity_rows: pd.DataFrame) -> None:
         direction_class = "limit-upper" if direction == "상한가" else "limit-lower"
         distance = int(item.get("잔여틱") or 0)
         distance_text = "0틱" if distance == 0 else f"{distance}틱 이내"
+        direction_text = direction if distance == 0 else f"{direction} 근접"
         body_rows.append(
             "<tr>"
             f'<td class="center">{escape(str(item.get("종목코드") or "-"))}</td>'
             f'<td class="left">{escape(str(item.get("종목명") or "-"))}</td>'
             f'<td class="center">{escape(str(item.get("상장시장") or "-"))}</td>'
-            f'<td class="center {direction_class}">{escape(direction)}</td>'
+            f'<td class="center {direction_class}">{escape(direction_text)}</td>'
             f'<td class="center">{escape(str(item.get("근접시점") or "-"))}</td>'
+            f'<td class="center {direction_class}">{escape(distance_text)}</td>'
             f'<td class="right">{escape(_format_price(reference_price))}</td>'
             f'<td class="right">{_limit_price_with_rate_html(item.get("상한가"), reference_price)}</td>'
             f'<td class="right">{_limit_price_with_rate_html(item.get("하한가"), reference_price)}</td>'
             f'<td class="right">{_limit_price_with_rate_html(item.get("시가"), reference_price)}</td>'
             f'<td class="right">{_limit_price_with_rate_html(item.get("최근접가격"), reference_price)}</td>'
-            f'<td class="center {direction_class}">{escape(distance_text)}</td>'
             f'<td class="right">{_limit_price_with_rate_html(item.get("종가"), reference_price)}</td>'
             "</tr>"
         )
@@ -2806,12 +2807,11 @@ def _render_nxt_limit_proximity_notice() -> None:
         st.markdown(
             '<div class="dashboard-notice"><ul>'
             "<li>근접 종목은 상한가 아래 또는 하한가 위 0~3틱 범위에 "
-            "시가·고가·저가·종가 중 하나가 들어온 종목입니다. 0틱은 상·하한가 "
-            "기록 종목을 포함합니다.</li>"
+            "도달한 종목입니다. 잔여틱이 0틱인 경우는 상·하한가 종목을 "
+            "의미합니다.</li>"
             "<li>가격대 경계를 넘을 때는 각 가격대의 호가가격단위를 순서대로 "
             "적용합니다. 잔여틱은 최근접가격과 상·하한가 사이의 호가 수입니다.</li>"
-            "<li>장중의 종가는 현재가를 뜻합니다. 기록시점은 시가 또는 NXT 분봉의 "
-            "최초 근접 범위 진입시각입니다.</li>"
+            "<li>장중의 종가는 현재가를 뜻합니다.</li>"
             "</ul></div>",
             unsafe_allow_html=True,
         )
