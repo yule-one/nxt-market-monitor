@@ -41,6 +41,8 @@
    - 상한가는 상한가 아래, 하한가는 하한가 위의 0~3틱 범위에 진입한 종목을 표시
    - 가격대 경계를 지날 때 각 구간의 호가가격단위를 한 칸씩 적용해 실제 3개 호가 범위를 계산
    - 최근접가격·잔여틱과 최초 근접 범위 진입시각을 표시하며 확인한 시각은 DB에 저장
+   - 잔여틱 0틱인 상·하한가와 1~3틱인 순수 근접 종목을 요약카드에서 분리 집계
+   - 확정일 판정 결과는 `nxt_limit_proximity_hits`에 일자·종목·방향별로 저장
 5. **KRX 시장조치 조회**
    - 시작일·종료일 조회
    - 전체 또는 8개 세부 분류 복수 선택 후 조회
@@ -78,6 +80,7 @@ streamlit run app.py
 
 ```powershell
 python scripts\backfill_market_history.py --start 2025-03-04 --end 2026-08-06 --workers 4
+python scripts\build_history_seed.py
 ```
 
 KRX 전체 종목 원본을 날짜마다 중복 보관하지 않고, 대시보드에 필요한 NXT 대상 종목만 `history.db`에 저장합니다. KRX API 응답 자체는 백필 과정에서 영구 캐시하지 않아 DB 용량 증가를 제한합니다.
@@ -124,9 +127,12 @@ NXT 공식 일별 시가·고가·저가·종가와 기준가격을 저장합니
 ```powershell
 python scripts\backfill_nxt_ohlc.py --start 2025-03-04 --end 2026-08-06 --workers 4 --force
 python scripts\backfill_nxt_limit_hits.py
+python scripts\backfill_nxt_limit_proximity_hits.py --start-date 2025-03-04 --end-date 2026-08-06
 ```
 
 상·하한가 이력 백필은 시장 개설일부터 DB의 최신 확정일까지 전체 OHLC를 판정하고, KIS 분봉 보존기간 안의 장중 도달 건만 최초 도달시각을 추가 조회합니다. 시가 도달은 항상 `시가`로 확정합니다. 분봉 보존기간을 지난 장중 도달 건은 가격과 도달 사실은 보관하되 정확한 최초 시각은 `RETENTION_EXPIRED` 상태로 남깁니다. 작업이 중단돼도 다음 실행에서 `PENDING` 건만 이어서 보강합니다.
+
+상·하한가 근접 이력 백필은 저장된 확정 OHLC만 사용하므로 외부 API를 다시 호출하지 않습니다. 잔여틱 0~3틱의 최근접가격과 방향을 저장하며, 이후 일일 확정 스냅샷 저장 때도 같은 테이블을 자동 갱신합니다.
 
 프리마켓 OHLC는 KIS의 과거 분봉 보관 범위(최대 1년) 안에서 날짜별로 추가 저장할 수 있습니다. 전 종목을 종목별로 조회하므로 거래일당 약 1분이 걸립니다.
 

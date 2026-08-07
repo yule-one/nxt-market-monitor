@@ -16,7 +16,11 @@ from src.krx_openapi import KrxDailySnapshot
 from src.kis_rest import FutureQuote, IndexQuote, NxtSessionQuote, RestQuote
 from src.market_realtime import KRX
 from src.models import NxtTradingStatus
-from src.nxt_price_limits import calculate_stock_price_limits, reached_limit_points
+from src.nxt_price_limits import (
+    calculate_stock_price_limits,
+    limit_proximity_ticks,
+    reached_limit_points,
+)
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -72,6 +76,26 @@ class NxtLimitHit:
     close_price: int | None
     hit_time: str | None
     hit_time_status: str
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class NxtLimitProximityHit:
+    trade_date: date
+    stock_code: str
+    stock_name: str
+    market: str
+    direction: str
+    distance_ticks: int
+    closest_price: int
+    reference_price: int | None
+    upper_limit_price: int | None
+    lower_limit_price: int | None
+    open_price: int | None
+    high_price: int | None
+    low_price: int | None
+    close_price: int | None
+    hit_time: str | None
     updated_at: datetime
 
 
@@ -418,6 +442,37 @@ class HistoricalMarketStore:
                     PRIMARY KEY (trade_date, stock_code, direction)
                 );
 
+                CREATE TABLE IF NOT EXISTS nxt_limit_proximity_hits (
+                    trade_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    distance_ticks INTEGER NOT NULL,
+                    closest_price INTEGER NOT NULL,
+                    reference_price INTEGER,
+                    upper_limit_price INTEGER,
+                    lower_limit_price INTEGER,
+                    open_price INTEGER,
+                    high_price INTEGER,
+                    low_price INTEGER,
+                    close_price INTEGER,
+                    hit_time TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (trade_date, stock_code, direction)
+                );
+
+                CREATE TABLE IF NOT EXISTS nxt_limit_proximity_daily (
+                    trade_date TEXT PRIMARY KEY,
+                    source_stock_count INTEGER NOT NULL,
+                    ohlc_stock_count INTEGER NOT NULL,
+                    upper_exact_count INTEGER NOT NULL,
+                    lower_exact_count INTEGER NOT NULL,
+                    upper_near_count INTEGER NOT NULL,
+                    lower_near_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS nxt_limit_hits (
                     trade_date TEXT NOT NULL,
                     stock_code TEXT NOT NULL,
@@ -451,6 +506,8 @@ class HistoricalMarketStore:
                     ON nxt_limit_hit_times(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_nxt_limit_proximity_times_date
                     ON nxt_limit_proximity_times(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_nxt_limit_proximity_hits_date
+                    ON nxt_limit_proximity_hits(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_nxt_limit_hits_date
                     ON nxt_limit_hits(trade_date);
                 """
@@ -597,6 +654,160 @@ class HistoricalMarketStore:
                 retention_expired=retention_expired,
             )
 
+    @staticmethod
+    def _replace_nxt_limit_proximity_hits(
+        connection: sqlite3.Connection,
+        trading_date: date,
+        statuses: list[NxtTradingStatus],
+    ) -> int:
+        date_key = trading_date.isoformat()
+        stored_times = {
+            (str(row["stock_code"]), str(row["direction"])): str(row["hit_time"])
+            for row in connection.execute(
+                """
+                SELECT stock_code, direction, hit_time
+                FROM nxt_limit_proximity_times
+                WHERE trade_date = ?
+                """,
+                (date_key,),
+            ).fetchall()
+        }
+        updated_at = datetime.now(timezone.utc).isoformat()
+        rows: list[tuple[object, ...]] = []
+        for item in statuses:
+            price_points = (
+                ("시가", item.open_price),
+                ("고가", item.high_price),
+                ("저가", item.low_price),
+                ("종가", item.current_price),
+            )
+            for direction, limit_price in (
+                ("상한가", item.upper_limit_price),
+                ("하한가", item.lower_limit_price),
+            ):
+                candidates: list[tuple[int, int, str]] = []
+                for label, price in price_points:
+                    distance = limit_proximity_ticks(
+                        price,
+                        limit_price,
+                        direction,
+                        market=item.market,
+                    )
+                    if distance is not None and price is not None:
+                        candidates.append((distance, int(price), label))
+                if not candidates:
+                    continue
+                distance, closest_price, _label = min(
+                    candidates,
+                    key=lambda value: (
+                        value[0],
+                        -value[1] if direction == "상한가" else value[1],
+                    ),
+                )
+                key = (item.stock_code, direction)
+                hit_time = (
+                    "OPEN"
+                    if any(label == "시가" for _distance, _price, label in candidates)
+                    else stored_times.get(key)
+                )
+                rows.append(
+                    (
+                        date_key,
+                        item.stock_code,
+                        item.stock_name,
+                        item.market,
+                        direction,
+                        distance,
+                        closest_price,
+                        item.reference_price,
+                        item.upper_limit_price,
+                        item.lower_limit_price,
+                        item.open_price,
+                        item.high_price,
+                        item.low_price,
+                        item.current_price,
+                        hit_time,
+                        updated_at,
+                    )
+                )
+        connection.execute(
+            "DELETE FROM nxt_limit_proximity_hits WHERE trade_date = ?",
+            (date_key,),
+        )
+        connection.executemany(
+            """
+            INSERT INTO nxt_limit_proximity_hits (
+                trade_date, stock_code, stock_name, market, direction,
+                distance_ticks, closest_price, reference_price,
+                upper_limit_price, lower_limit_price, open_price, high_price,
+                low_price, close_price, hit_time, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        ohlc_count = sum(
+            all(
+                value is not None
+                for value in (
+                    item.open_price,
+                    item.high_price,
+                    item.low_price,
+                    item.current_price,
+                )
+            )
+            for item in statuses
+        )
+        counts = {
+            (direction, exact): sum(
+                str(row[4]) == direction
+                and ((int(row[5]) == 0) if exact else (1 <= int(row[5]) <= 3))
+                for row in rows
+            )
+            for direction in ("상한가", "하한가")
+            for exact in (True, False)
+        }
+        connection.execute(
+            """
+            INSERT INTO nxt_limit_proximity_daily (
+                trade_date, source_stock_count, ohlc_stock_count,
+                upper_exact_count, lower_exact_count,
+                upper_near_count, lower_near_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                source_stock_count = excluded.source_stock_count,
+                ohlc_stock_count = excluded.ohlc_stock_count,
+                upper_exact_count = excluded.upper_exact_count,
+                lower_exact_count = excluded.lower_exact_count,
+                upper_near_count = excluded.upper_near_count,
+                lower_near_count = excluded.lower_near_count,
+                updated_at = excluded.updated_at
+            """,
+            (
+                date_key,
+                len(statuses),
+                ohlc_count,
+                counts[("상한가", True)],
+                counts[("하한가", True)],
+                counts[("상한가", False)],
+                counts[("하한가", False)],
+                updated_at,
+            ),
+        )
+        return len(rows)
+
+    def replace_nxt_limit_proximity_hits(
+        self,
+        trading_date: date,
+        statuses: Iterable[NxtTradingStatus],
+    ) -> int:
+        status_rows = list(statuses)
+        with self._lock, self._connect() as connection:
+            return self._replace_nxt_limit_proximity_hits(
+                connection,
+                trading_date,
+                status_rows,
+            )
+
     def save_historical_snapshot(
         self,
         trading_date: date,
@@ -682,6 +893,11 @@ class HistoricalMarketStore:
                 ],
             )
             self._replace_nxt_limit_hits(connection, trading_date, status_rows)
+            self._replace_nxt_limit_proximity_hits(
+                connection,
+                trading_date,
+                status_rows,
+            )
             krx_rows: list[tuple[object, ...]] = []
             for symbol in symbols:
                 quote = krx_snapshot.stock_quotes.get((symbol, KRX))
@@ -795,6 +1011,11 @@ class HistoricalMarketStore:
                 ],
             )
             self._replace_nxt_limit_hits(connection, trading_date, status_rows)
+            self._replace_nxt_limit_proximity_hits(
+                connection,
+                trading_date,
+                status_rows,
+            )
         return len(status_rows)
 
     def save_nxt_session_quotes(
@@ -993,6 +1214,23 @@ class HistoricalMarketStore:
                     for (stock_code, direction), hit_time in hit_times.items()
                 ],
             )
+            connection.executemany(
+                """
+                UPDATE nxt_limit_proximity_hits
+                SET hit_time = ?, updated_at = ?
+                WHERE trade_date = ? AND stock_code = ? AND direction = ?
+                """,
+                [
+                    (
+                        hit_time,
+                        updated_at,
+                        trading_date.isoformat(),
+                        stock_code,
+                        direction,
+                    )
+                    for (stock_code, direction), hit_time in hit_times.items()
+                ],
+            )
         return len(hit_times)
 
     def load_nxt_limit_proximity_times(
@@ -1011,6 +1249,114 @@ class HistoricalMarketStore:
         return {
             (str(row["stock_code"]), str(row["direction"])): str(row["hit_time"])
             for row in rows
+        }
+
+    def load_nxt_limit_proximity_hits(
+        self,
+        trading_date: date,
+    ) -> list[NxtLimitProximityHit]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM nxt_limit_proximity_hits
+                WHERE trade_date = ?
+                ORDER BY direction, distance_ticks, stock_code
+                """,
+                (trading_date.isoformat(),),
+            ).fetchall()
+        return [
+            NxtLimitProximityHit(
+                trade_date=trading_date,
+                stock_code=str(row["stock_code"]),
+                stock_name=str(row["stock_name"]),
+                market=str(row["market"]),
+                direction=str(row["direction"]),
+                distance_ticks=int(row["distance_ticks"]),
+                closest_price=int(row["closest_price"]),
+                reference_price=row["reference_price"],
+                upper_limit_price=row["upper_limit_price"],
+                lower_limit_price=row["lower_limit_price"],
+                open_price=row["open_price"],
+                high_price=row["high_price"],
+                low_price=row["low_price"],
+                close_price=row["close_price"],
+                hit_time=str(row["hit_time"]) if row["hit_time"] else None,
+                updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            )
+            for row in rows
+        ]
+
+    def rebuild_nxt_limit_proximity_hits(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        """저장된 NXT 일별 OHLC에서 0~3틱 근접 이력을 다시 생성합니다."""
+
+        with self._lock, self._connect() as connection:
+            date_rows = connection.execute(
+                """
+                SELECT DISTINCT trade_date
+                FROM nxt_daily_quotes
+                WHERE trade_date BETWEEN ? AND ?
+                ORDER BY trade_date
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+            connection.execute(
+                "DELETE FROM nxt_limit_proximity_hits WHERE trade_date BETWEEN ? AND ?",
+                (start_date.isoformat(), end_date.isoformat()),
+            )
+            connection.execute(
+                "DELETE FROM nxt_limit_proximity_daily WHERE trade_date BETWEEN ? AND ?",
+                (start_date.isoformat(), end_date.isoformat()),
+            )
+        total_rows = 0
+        for row in date_rows:
+            trading_date = date.fromisoformat(str(row["trade_date"]))
+            total_rows += self.replace_nxt_limit_proximity_hits(
+                trading_date,
+                self.load_nxt_statuses(trading_date),
+            )
+        return total_rows
+
+    def nxt_limit_proximity_hit_coverage(self) -> dict[str, object]:
+        with self._lock, self._connect() as connection:
+            daily_row = connection.execute(
+                """
+                SELECT COUNT(*) AS trading_days,
+                       MIN(trade_date) AS first_date,
+                       MAX(trade_date) AS last_date
+                FROM nxt_limit_proximity_daily
+                """
+            ).fetchone()
+            hit_row = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count,
+                       COUNT(DISTINCT trade_date) AS hit_days,
+                       SUM(CASE WHEN distance_ticks = 0 THEN 1 ELSE 0 END)
+                           AS exact_count,
+                       SUM(CASE WHEN distance_ticks BETWEEN 1 AND 3 THEN 1 ELSE 0 END)
+                           AS near_count
+                FROM nxt_limit_proximity_hits
+                """
+            ).fetchone()
+        return {
+            "row_count": int(hit_row["row_count"] or 0),
+            "trading_days": int(daily_row["trading_days"] or 0),
+            "hit_days": int(hit_row["hit_days"] or 0),
+            "first_date": (
+                date.fromisoformat(str(daily_row["first_date"]))
+                if daily_row["first_date"]
+                else None
+            ),
+            "last_date": (
+                date.fromisoformat(str(daily_row["last_date"]))
+                if daily_row["last_date"]
+                else None
+            ),
+            "exact_count": int(hit_row["exact_count"] or 0),
+            "near_count": int(hit_row["near_count"] or 0),
         }
 
     def load_nxt_limit_hits(self, trading_date: date) -> list[NxtLimitHit]:
