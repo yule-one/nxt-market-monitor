@@ -408,6 +408,16 @@ class HistoricalMarketStore:
                     PRIMARY KEY (trade_date, stock_code, direction)
                 );
 
+                CREATE TABLE IF NOT EXISTS nxt_limit_proximity_times (
+                    trade_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    hit_time TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (trade_date, stock_code, direction)
+                );
+
                 CREATE TABLE IF NOT EXISTS nxt_limit_hits (
                     trade_date TEXT NOT NULL,
                     stock_code TEXT NOT NULL,
@@ -439,6 +449,8 @@ class HistoricalMarketStore:
                     ON nxt_session_quotes(trade_date, session);
                 CREATE INDEX IF NOT EXISTS idx_nxt_limit_hit_times_date
                     ON nxt_limit_hit_times(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_nxt_limit_proximity_times_date
+                    ON nxt_limit_proximity_times(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_nxt_limit_hits_date
                     ON nxt_limit_hits(trade_date);
                 """
@@ -937,6 +949,61 @@ class HistoricalMarketStore:
                 """
                 SELECT stock_code, direction, hit_time
                 FROM nxt_limit_hit_times
+                WHERE trade_date = ?
+                """,
+                (trading_date.isoformat(),),
+            ).fetchall()
+        return {
+            (str(row["stock_code"]), str(row["direction"])): str(row["hit_time"])
+            for row in rows
+        }
+
+    def save_nxt_limit_proximity_times(
+        self,
+        trading_date: date,
+        hit_times: dict[tuple[str, str], str],
+        *,
+        source: str = "KIS_NXT_MINUTE",
+    ) -> int:
+        """종목·방향별 3호가 근접 범위 최초 진입시각을 누적 저장합니다."""
+
+        if not hit_times:
+            return 0
+        updated_at = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO nxt_limit_proximity_times (
+                    trade_date, stock_code, direction, hit_time, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trade_date, stock_code, direction) DO UPDATE SET
+                    hit_time = excluded.hit_time,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        trading_date.isoformat(),
+                        stock_code,
+                        direction,
+                        hit_time,
+                        source,
+                        updated_at,
+                    )
+                    for (stock_code, direction), hit_time in hit_times.items()
+                ],
+            )
+        return len(hit_times)
+
+    def load_nxt_limit_proximity_times(
+        self,
+        trading_date: date,
+    ) -> dict[tuple[str, str], str]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT stock_code, direction, hit_time
+                FROM nxt_limit_proximity_times
                 WHERE trade_date = ?
                 """,
                 (trading_date.isoformat(),),

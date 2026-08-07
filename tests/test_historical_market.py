@@ -266,6 +266,28 @@ def test_historical_store_round_trips_nxt_limit_hit_times(tmp_path: Path) -> Non
     ] == "081100"
 
 
+def test_historical_store_round_trips_nxt_limit_proximity_times(
+    tmp_path: Path,
+) -> None:
+    store = HistoricalMarketStore(tmp_path / "history.db")
+    trading_date = date(2026, 8, 6)
+    hit_times = {
+        ("005930", "상한가"): "080500",
+        ("000660", "하한가"): "OPEN",
+    }
+
+    assert store.save_nxt_limit_proximity_times(trading_date, hit_times) == 2
+    assert store.load_nxt_limit_proximity_times(trading_date) == hit_times
+
+    assert store.save_nxt_limit_proximity_times(
+        trading_date,
+        {("005930", "상한가"): "080600"},
+    ) == 1
+    assert store.load_nxt_limit_proximity_times(trading_date)[
+        ("005930", "상한가")
+    ] == "080600"
+
+
 def test_historical_store_materializes_and_updates_nxt_limit_hits(
     tmp_path: Path,
 ) -> None:

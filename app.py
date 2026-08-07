@@ -48,7 +48,10 @@ from src.market_realtime import NXT, MarketAggregator, MarketDataStore, WatchSym
 from src.models import NxtTradingStatus
 from src.nxt_client import NxtClient
 from src.nxt_price_limits import (
+    first_limit_proximity_time,
     format_limit_hit_time,
+    limit_proximity_ticks,
+    reached_limit_proximity_points,
     reached_limit_points,
 )
 from src.nxt_change_store import (
@@ -61,7 +64,8 @@ from src.nxt_change_store import (
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 7
-HISTORICAL_STORE_RUNTIME_VERSION = 8
+HISTORICAL_STORE_RUNTIME_VERSION = 9
+NXT_LIMIT_PROXIMITY_TICKS = 3
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
     WatchSymbol("000660", "SK하이닉스"),
@@ -354,7 +358,13 @@ def _get_historical_market_store(runtime_version: int) -> HistoricalMarketStore:
 
 def get_historical_market_store() -> HistoricalMarketStore:
     store = _get_historical_market_store(HISTORICAL_STORE_RUNTIME_VERSION)
-    if not hasattr(store, "nxt_limit_hit_coverage"):
+    if not all(
+        hasattr(store, method_name)
+        for method_name in (
+            "nxt_limit_hit_coverage",
+            "load_nxt_limit_proximity_times",
+        )
+    ):
         _get_historical_market_store.clear()
         store = _get_historical_market_store(HISTORICAL_STORE_RUNTIME_VERSION)
     return store
@@ -2095,6 +2105,84 @@ def _nxt_limit_hit_rows(
     )
 
 
+def _nxt_limit_proximity_rows(
+    frame: pd.DataFrame,
+    *,
+    hit_times: dict[tuple[str, str], str] | None = None,
+) -> pd.DataFrame:
+    hit_times = hit_times or {}
+    rows: list[dict[str, object]] = []
+    price_fields = (
+        ("시가", "시가"),
+        ("고가", "고가"),
+        ("저가", "저가"),
+        ("종가", "종가"),
+    )
+    for item in frame.to_dict("records"):
+        market = str(item.get("상장시장") or "")
+        for direction in ("상한가", "하한가"):
+            limit_price = item.get(direction)
+            proximity_points = reached_limit_proximity_points(
+                open_price=item.get("시가"),
+                high_price=item.get("고가"),
+                low_price=item.get("저가"),
+                close_price=item.get("종가"),
+                limit_price=limit_price,
+                direction=direction,
+                max_ticks=NXT_LIMIT_PROXIMITY_TICKS,
+                market=market,
+            )
+            if not proximity_points:
+                continue
+            candidates: list[tuple[int, int]] = []
+            for label, field_name in price_fields:
+                if label not in proximity_points:
+                    continue
+                raw_price = item.get(field_name)
+                distance = limit_proximity_ticks(
+                    None if raw_price is None or pd.isna(raw_price) else int(raw_price),
+                    None
+                    if limit_price is None or pd.isna(limit_price)
+                    else int(limit_price),
+                    direction,
+                    max_ticks=NXT_LIMIT_PROXIMITY_TICKS,
+                    market=market,
+                )
+                if distance is not None:
+                    candidates.append((distance, int(raw_price)))
+            if not candidates:
+                continue
+            distance, closest_price = min(
+                candidates,
+                key=lambda value: (
+                    value[0],
+                    -value[1] if direction == "상한가" else value[1],
+                ),
+            )
+            row = dict(item)
+            row["근접구분"] = direction
+            row["근접시점"] = format_limit_hit_time(
+                "OPEN"
+                if "시가" in proximity_points
+                else hit_times.get((str(item["종목코드"]), direction))
+            )
+            row["최근접가격"] = closest_price
+            row["잔여틱"] = distance
+            row["근접지점"] = proximity_points
+            rows.append(row)
+    return pd.DataFrame(
+        rows,
+        columns=[
+            *NXT_LIMIT_COLUMNS,
+            "근접구분",
+            "근접시점",
+            "최근접가격",
+            "잔여틱",
+            "근접지점",
+        ],
+    )
+
+
 def _resolve_nxt_limit_hit_times(
     selected_date: date,
     hit_rows: pd.DataFrame,
@@ -2165,6 +2253,106 @@ def _resolve_nxt_limit_hit_times(
 
     if new_values:
         store.save_nxt_limit_hit_times(selected_date, new_values)
+        resolved.update(new_values)
+    note = (
+        f"일부 종목의 최초 기록시각을 확인하지 못했습니다: {errors[0]}"
+        if errors
+        else None
+    )
+    return resolved, note
+
+
+def _resolve_nxt_limit_proximity_times(
+    selected_date: date,
+    proximity_rows: pd.DataFrame,
+) -> tuple[dict[tuple[str, str], str], str | None]:
+    """3호가 근접 후보의 최초 진입시각을 분봉으로 확인해 DB에 저장합니다."""
+
+    store = get_historical_market_store()
+    resolved = store.load_nxt_limit_proximity_times(selected_date)
+    new_values: dict[tuple[str, str], str] = {}
+    missing_by_symbol: dict[str, list[tuple[str, int, str]]] = {}
+    for item in proximity_rows.to_dict("records"):
+        symbol = str(item["종목코드"])
+        direction = str(item["근접구분"])
+        key = (symbol, direction)
+        points = tuple(item.get("근접지점") or ())
+        if "시가" in points:
+            if resolved.get(key) != "OPEN":
+                new_values[key] = "OPEN"
+            continue
+        if key in resolved:
+            continue
+        raw_limit_price = item.get(direction)
+        if raw_limit_price is None or pd.isna(raw_limit_price):
+            continue
+        missing_by_symbol.setdefault(symbol, []).append(
+            (
+                direction,
+                int(raw_limit_price),
+                str(item.get("상장시장") or ""),
+            )
+        )
+
+    if new_values:
+        store.save_nxt_limit_proximity_times(selected_date, new_values)
+        resolved.update(new_values)
+    if not missing_by_symbol:
+        return resolved, None
+
+    today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    earliest_available = (pd.Timestamp(today) - pd.DateOffset(years=1)).date()
+    if selected_date < earliest_available:
+        return (
+            resolved,
+            "NXT 분봉 보관 범위를 지난 날짜는 시가 외 최초 기록시각을 확인할 수 없습니다.",
+        )
+    app_key = _secret_value("KIS_APP_KEY")
+    app_secret = _secret_value("KIS_APP_SECRET")
+    if not app_key or not app_secret:
+        return resolved, "최초 기록시각 확인에는 KIS App Key와 App Secret이 필요합니다."
+
+    end_time = "200000"
+    if selected_date == today:
+        now = pd.Timestamp.now(tz="Asia/Seoul")
+        if now.strftime("%H%M%S") < "080000":
+            return resolved, None
+        end_time = min(now.strftime("%H%M%S"), "200000")
+    client = KisRestClient(KisCredentials(app_key, app_secret))
+    errors: list[str] = []
+    for symbol, targets in missing_by_symbol.items():
+        try:
+            bars = client.fetch_nxt_minute_bars(
+                symbol,
+                selected_date,
+                end_time=end_time,
+            )
+        except Exception as exc:
+            errors.append(f"{symbol}: {exc}")
+            continue
+        minute_prices = [
+            (
+                bar.trade_time,
+                bar.open_price,
+                bar.high_price,
+                bar.low_price,
+                bar.close_price,
+            )
+            for bar in bars
+        ]
+        for direction, limit_price, market in targets:
+            hit_time = first_limit_proximity_time(
+                minute_prices,
+                limit_price,
+                direction,
+                max_ticks=NXT_LIMIT_PROXIMITY_TICKS,
+                market=market,
+            )
+            if hit_time is not None:
+                new_values[(symbol, direction)] = hit_time
+
+    if new_values:
+        store.save_nxt_limit_proximity_times(selected_date, new_values)
         resolved.update(new_values)
     note = (
         f"일부 종목의 최초 기록시각을 확인하지 못했습니다: {errors[0]}"
@@ -2452,6 +2640,276 @@ def nxt_price_limits_page() -> None:
         tradable_markets,
     )
     _render_nxt_limit_notice()
+
+
+def _render_limit_proximity_summary(
+    frame: pd.DataFrame,
+    proximity_rows: pd.DataFrame,
+) -> None:
+    ohlc_count = int(
+        frame[["시가", "고가", "저가", "종가"]].notna().all(axis=1).sum()
+    )
+
+    def direction_count(direction: str) -> int:
+        if proximity_rows.empty:
+            return 0
+        return int(
+            proximity_rows.loc[
+                proximity_rows["근접구분"] == direction,
+                "종목코드",
+            ].nunique()
+        )
+
+    summary_items = [
+        ("조회 종목수", f"{len(frame):,}", None),
+        (
+            "OHLC 수록 종목수 (?)",
+            f"{ohlc_count:,}",
+            "시가·고가·저가·종가 값이 모두 수록된 종목 수입니다.",
+        ),
+        ("상한가 근접 종목수", f"{direction_count('상한가'):,}종목", None),
+        ("하한가 근접 종목수", f"{direction_count('하한가'):,}종목", None),
+    ]
+    summary_html = "".join(
+        '<div class="limit-summary-item"'
+        + (f' title="{escape(tooltip, quote=True)}" tabindex="0"' if tooltip else "")
+        + ">"
+        f'<div class="limit-summary-label">{escape(label)}</div>'
+        f'<div class="limit-summary-value">{escape(value)}</div>'
+        "</div>"
+        for label, value, tooltip in summary_items
+    )
+    st.markdown(
+        f'<div class="limit-summary-strip">{summary_html}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_nxt_limit_proximity_table(proximity_rows: pd.DataFrame) -> None:
+    if proximity_rows.empty:
+        st.info("선택 조건에서 상·하한가 3틱 이내에 진입한 종목이 없습니다.")
+        return
+    matched = proximity_rows.copy()
+    matched["근접구분순서"] = matched["근접구분"].map(
+        {"상한가": 0, "하한가": 1}
+    )
+    matched["근접시점순서"] = matched["근접시점"].map(
+        lambda value: (
+            "0000"
+            if value == "시가"
+            else str(value).replace(":", "")
+            if re.fullmatch(r"\d{2}:\d{2}", str(value))
+            else "9999"
+        )
+    )
+    matched = matched.sort_values(
+        ["근접구분순서", "잔여틱", "근접시점순서", "종목코드"],
+        ascending=[True, True, True, True],
+    )
+    headers = [
+        "종목코드",
+        "종목명",
+        "상장시장",
+        "상·하한가 근접 구분",
+        "기록시점",
+        "기준가격",
+        "상한가",
+        "하한가",
+        "시가",
+        "최근접가격",
+        "잔여틱",
+        "종가",
+    ]
+    body_rows: list[str] = []
+    for item in matched.to_dict("records"):
+        reference_price = item.get("기준가격")
+        direction = str(item.get("근접구분") or "")
+        direction_class = "limit-upper" if direction == "상한가" else "limit-lower"
+        distance = int(item.get("잔여틱") or 0)
+        distance_text = "0틱" if distance == 0 else f"{distance}틱 이내"
+        body_rows.append(
+            "<tr>"
+            f'<td class="center">{escape(str(item.get("종목코드") or "-"))}</td>'
+            f'<td class="left">{escape(str(item.get("종목명") or "-"))}</td>'
+            f'<td class="center">{escape(str(item.get("상장시장") or "-"))}</td>'
+            f'<td class="center {direction_class}">{escape(direction)}</td>'
+            f'<td class="center">{escape(str(item.get("근접시점") or "-"))}</td>'
+            f'<td class="right">{escape(_format_price(reference_price))}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("상한가"), reference_price)}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("하한가"), reference_price)}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("시가"), reference_price)}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("최근접가격"), reference_price)}</td>'
+            f'<td class="center {direction_class}">{escape(distance_text)}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("종가"), reference_price)}</td>'
+            "</tr>"
+        )
+    header_html = "".join(f"<th>{escape(header)}</th>" for header in headers)
+    st.markdown(
+        '<div class="limit-hit-table-wrap">'
+        '<table class="limit-hit-table">'
+        f"<thead><tr>{header_html}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_nxt_limit_proximity_result(
+    frame: pd.DataFrame,
+    *,
+    live: bool,
+    selected_date: date,
+) -> None:
+    if frame.empty:
+        st.info("조회된 NXT 종목 시세가 없습니다.")
+        return
+    proximity_rows = _nxt_limit_proximity_rows(frame)
+    hit_times, resolution_note = _resolve_nxt_limit_proximity_times(
+        selected_date,
+        proximity_rows,
+    )
+    proximity_rows = _nxt_limit_proximity_rows(frame, hit_times=hit_times)
+    _render_limit_proximity_summary(frame, proximity_rows)
+    if resolution_note:
+        st.caption(resolution_note)
+
+    filter_columns = st.columns([1, 2])
+    market_filter = filter_columns[0].selectbox(
+        "상장시장",
+        ["전체", "KOSPI", "KOSDAQ"],
+        key=f"nxt_proximity_market_{'live' if live else 'daily'}",
+    )
+    search_term = filter_columns[1].text_input(
+        "종목 검색",
+        placeholder="종목명 또는 6자리 종목코드",
+        key=f"nxt_proximity_search_{'live' if live else 'daily'}",
+    ).strip()
+    filtered = frame
+    if market_filter != "전체":
+        filtered = filtered[filtered["상장시장"] == market_filter]
+    if search_term:
+        filtered = filtered[
+            filtered["종목명"].str.contains(search_term, case=False, na=False)
+            | filtered["종목코드"].astype(str).str.contains(search_term, na=False)
+        ]
+
+    filtered_symbols = set(filtered["종목코드"].astype(str))
+    _render_nxt_limit_proximity_table(
+        proximity_rows[
+            proximity_rows["종목코드"].astype(str).isin(filtered_symbols)
+        ]
+    )
+
+
+def _render_nxt_limit_proximity_notice() -> None:
+    with st.expander("유의사항", expanded=False):
+        st.markdown(
+            '<div class="dashboard-notice"><ul>'
+            "<li>근접 종목은 상한가 아래 또는 하한가 위 0~3틱 범위에 "
+            "시가·고가·저가·종가 중 하나가 들어온 종목입니다. 0틱은 상·하한가 "
+            "기록 종목을 포함합니다.</li>"
+            "<li>가격대 경계를 넘을 때는 각 가격대의 호가가격단위를 순서대로 "
+            "적용합니다. 잔여틱은 최근접가격과 상·하한가 사이의 호가 수입니다.</li>"
+            "<li>장중의 종가는 현재가를 뜻합니다. 기록시점은 시가 또는 NXT 분봉의 "
+            "최초 근접 범위 진입시각입니다.</li>"
+            "</ul></div>",
+            unsafe_allow_html=True,
+        )
+
+
+@st.fragment(run_every="2s")
+def _render_live_nxt_limit_proximity_page(
+    collector: KisRestUniverseCollector,
+    symbols: list[WatchSymbol],
+    markets: dict[str, str],
+    tradable_markets: dict[str, str],
+) -> None:
+    collector.heartbeat()
+    status = collector.status()
+    frame = _live_nxt_limit_frame(
+        symbols,
+        markets,
+        tradable_markets,
+        collector.snapshot(),
+    )
+    completed_at = (
+        status.last_completed_at.strftime("%H:%M:%S")
+        if status.last_completed_at is not None
+        else "전체 갱신 전"
+    )
+    st.caption(
+        f"당일 장중 NXT 시세 · {status.state} · "
+        f"수신 {status.quote_count:,}/{status.universe_count:,}종목 · "
+        f"전체 갱신 {completed_at}"
+    )
+    _render_nxt_limit_proximity_result(
+        frame,
+        live=True,
+        selected_date=pd.Timestamp.now(tz="Asia/Seoul").date(),
+    )
+
+
+def nxt_price_limit_proximity_page() -> None:
+    st.title("NXT 상·하한가 근접 종목 현황")
+    today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    selected_date = st.date_input(
+        "조회일자",
+        value=today,
+        min_value=NXT_LAUNCH_DATE,
+        max_value=today,
+        format="YYYY-MM-DD",
+        key="nxt_limit_proximity_date",
+    )
+    if selected_date < today:
+        statuses = get_historical_market_store().load_nxt_statuses(selected_date)
+        if not statuses:
+            st.info("선택한 일자의 확정 NXT 종목 시세가 DB에 없습니다.")
+            return
+        _render_nxt_limit_proximity_result(
+            _historical_nxt_limit_frame(statuses),
+            live=False,
+            selected_date=selected_date,
+        )
+        _render_nxt_limit_proximity_notice()
+        return
+
+    with st.spinner("당일 NXT 종목 목록을 불러오고 있습니다..."):
+        (
+            symbols,
+            markets,
+            tradable_markets,
+            _unavailable_reasons,
+            _current_statuses,
+        ) = _nxt_universe_for_date(today)
+        if not symbols:
+            (
+                _universe_date,
+                symbols,
+                markets,
+                tradable_markets,
+                _unavailable_reasons,
+            ) = _latest_nxt_universe()
+    if not symbols:
+        st.error("당일 조회에 사용할 NXT 종목 목록이 없습니다.")
+        return
+    app_key = _secret_value("KIS_APP_KEY")
+    app_secret = _secret_value("KIS_APP_SECRET")
+    if not app_key or not app_secret:
+        st.warning("당일 장중 조회를 위해 KIS App Key와 App Secret이 필요합니다.")
+        return
+    collector = get_rest_universe_runtime(
+        app_key,
+        app_secret,
+        REST_UNIVERSE_RUNTIME_VERSION,
+    )
+    collector.start(symbols, REST_UNIVERSE_REFRESH_SECONDS)
+    _render_live_nxt_limit_proximity_page(
+        collector,
+        symbols,
+        markets,
+        tradable_markets,
+    )
+    _render_nxt_limit_proximity_notice()
 
 
 def load_nxt_changes(
@@ -3017,6 +3475,11 @@ def main() -> None:
             default=True,
         ),
         st.Page(nxt_price_limits_page, title="NXT 상·하한가 종목 현황", icon="↕️"),
+        st.Page(
+            nxt_price_limit_proximity_page,
+            title="NXT 상·하한가 근접 종목 현황",
+            icon="🎯",
+        ),
         st.Page(market_history_page, title="NXT·KRX 일별 거래 추이", icon="📈"),
         st.Page(disclosure_page, title="KRX 시장조치 조회", icon="📋"),
         st.Page(nxt_changes_page, title="NXT 정규시장 종목 변동내역", icon="🔄"),
