@@ -18,7 +18,8 @@ from src.historical_market import (
 from src.kis_rest import FutureQuote, IndexQuote, NxtSessionQuote, RestQuote
 from src.krx_openapi import KrxDailySnapshot
 from src.market_realtime import KRX
-from src.models import NxtTradingStatus
+from src.models import NxtChange, NxtTradingStatus
+from src.nxt_change_store import NxtChangeStore
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -122,6 +123,57 @@ def _snapshot(trading_date: date) -> tuple[list[NxtTradingStatus], KrxDailySnaps
         {"005930": 5_969_782_550, "000660": 728_002_365, "999999": 1},
         futures,
     )
+
+
+def test_historical_store_builds_reclassified_daily_eligibility(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    trading_date = date(2026, 8, 6)
+    change_store = NxtChangeStore(database_path)
+    change_store.replace_range(
+        trading_date,
+        trading_date,
+        [
+            NxtChange(
+                change_date=trading_date,
+                stock_code="005930",
+                stock_name="삼성전자",
+                market="KOSPI",
+                change_type="편출",
+                reason="투자경고/위험 지정",
+            ),
+            NxtChange(
+                change_date=trading_date,
+                stock_code="123450",
+                stock_name="실제편출",
+                market="KOSDAQ",
+                change_type="편출",
+                reason="정기변경",
+            ),
+        ],
+    )
+    store = HistoricalMarketStore(database_path)
+    statuses, _snapshot_data = _snapshot(trading_date)
+    store.save_nxt_statuses(trading_date, statuses)
+
+    summary = store.list_nxt_eligibility_summaries(
+        trading_date,
+        trading_date,
+    )[0]
+    assert summary.target_stock_count == 2
+    assert summary.tradable_stock_count == 1
+    assert summary.unavailable_stock_count == 1
+    assert summary.restriction_start_stock_count == 1
+    assert summary.exclusion_stock_count == 1
+    reason_counts = {
+        (item.reason_group, item.reason): item.stock_count
+        for item in store.list_nxt_eligibility_reason_counts(
+            trading_date,
+            trading_date,
+        )
+    }
+    assert reason_counts[("거래불가사유", "거래정지")] == 1
+    assert reason_counts[("거래불가", "투자경고/위험 지정")] == 1
+    assert reason_counts[("편출", "정기변경")] == 1
 
 
 def test_historical_store_round_trip_and_metrics(tmp_path: Path) -> None:

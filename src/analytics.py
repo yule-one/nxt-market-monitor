@@ -7,7 +7,7 @@ from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
 
-from src.config import STATE_CATEGORIES, TEMPORARY_EXCLUSION_KEYWORDS
+from src.config import STATE_CATEGORIES, TRADING_RESTRICTION_START_KEYWORDS
 from src.models import (
     Disclosure,
     NxtChange,
@@ -15,6 +15,7 @@ from src.models import (
     NxtTradingStatus,
     StatusPeriod,
 )
+from src.nxt_eligibility import classify_nxt_change
 
 
 def normalize_name(value: str) -> str:
@@ -23,7 +24,7 @@ def normalize_name(value: str) -> str:
 
 def is_temporary_exclusion(change: NxtChange) -> bool:
     return change.change_type == "편출" and any(
-        keyword in change.reason for keyword in TEMPORARY_EXCLUSION_KEYWORDS
+        keyword in change.reason for keyword in TRADING_RESTRICTION_START_KEYWORDS
     )
 
 
@@ -90,7 +91,7 @@ def build_nxt_states_by_date(
 def state_is_nxt_related(state: NxtStockState | None) -> bool:
     """조회일 현재 NXT 매매체결 대상인 상태만 반환합니다."""
 
-    return bool(state and state.is_tradable)
+    return bool(state and (state.is_tradable or state.is_temporary_exclusion))
 
 
 def _nxt_name_index(changes: Sequence[NxtChange]) -> dict[tuple[str, str], str]:
@@ -306,7 +307,8 @@ def nxt_changes_to_frame(changes: Sequence[NxtChange]) -> pd.DataFrame:
                 "종목코드": item.stock_code,
                 "종목명": item.stock_name,
                 "상장시장": item.market,
-                "변동내역": item.change_type,
+                "변동내역": classify_nxt_change(item),
+                "원본변동내역": item.change_type,
                 "변동사유": item.reason,
             }
             for item in changes
@@ -345,14 +347,14 @@ def build_daily_nxt_metrics(
                     {
                         item.stock_code
                         for item in daily_changes
-                        if item.change_type == "편입"
+                        if classify_nxt_change(item) == "편입"
                     }
                 ),
                 "당일 편출 종목수": len(
                     {
                         item.stock_code
                         for item in daily_changes
-                        if item.change_type == "편출"
+                        if classify_nxt_change(item) == "편출"
                     }
                 ),
             }
@@ -388,14 +390,14 @@ def build_daily_nxt_metrics_from_counts(
                     {
                         item.stock_code
                         for item in daily_changes
-                        if item.change_type == "편입"
+                        if classify_nxt_change(item) == "편입"
                     }
                 ),
                 "당일 편출 종목수": len(
                     {
                         item.stock_code
                         for item in daily_changes
-                        if item.change_type == "편출"
+                        if classify_nxt_change(item) == "편출"
                     }
                 ),
             }

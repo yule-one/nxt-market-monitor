@@ -15,7 +15,14 @@ from zoneinfo import ZoneInfo
 from src.krx_openapi import KrxDailySnapshot
 from src.kis_rest import FutureQuote, IndexQuote, NxtSessionQuote, RestQuote
 from src.market_realtime import KRX
-from src.models import NxtTradingStatus
+from src.models import NxtChange, NxtTradingStatus
+from src.nxt_eligibility import (
+    NxtDailyEligibilitySummary,
+    NxtDailyReasonCount,
+    NxtEligibilityAdjustment,
+    calculate_daily_eligibility,
+    infer_missing_restriction_statuses,
+)
 from src.nxt_price_limits import (
     calculate_stock_price_limits,
     limit_proximity_ticks,
@@ -352,6 +359,57 @@ class HistoricalMarketStore:
                     PRIMARY KEY (trade_date, stock_code)
                 );
 
+                CREATE TABLE IF NOT EXISTS nxt_membership_changes (
+                    change_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    change_type TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    isin TEXT NOT NULL,
+                    registered_at INTEGER NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (change_date, stock_code, change_type, reason)
+                );
+
+                CREATE TABLE IF NOT EXISTS nxt_daily_eligibility_summary (
+                    trade_date TEXT PRIMARY KEY,
+                    target_stock_count INTEGER NOT NULL,
+                    tradable_stock_count INTEGER NOT NULL,
+                    unavailable_stock_count INTEGER NOT NULL,
+                    target_kospi_count INTEGER NOT NULL,
+                    target_kosdaq_count INTEGER NOT NULL,
+                    tradable_kospi_count INTEGER NOT NULL,
+                    tradable_kosdaq_count INTEGER NOT NULL,
+                    inclusion_stock_count INTEGER NOT NULL,
+                    exclusion_stock_count INTEGER NOT NULL,
+                    restriction_start_stock_count INTEGER NOT NULL,
+                    restriction_end_stock_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS nxt_daily_eligibility_reason_counts (
+                    trade_date TEXT NOT NULL,
+                    reason_group TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    stock_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (trade_date, reason_group, reason)
+                );
+
+                CREATE TABLE IF NOT EXISTS nxt_daily_eligibility_adjustments (
+                    trade_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    unavailable_reason TEXT NOT NULL,
+                    restriction_start_date TEXT NOT NULL,
+                    restriction_end_date TEXT,
+                    basis TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (trade_date, stock_code)
+                );
+
                 CREATE TABLE IF NOT EXISTS krx_daily_quotes (
                     trade_date TEXT NOT NULL,
                     stock_code TEXT NOT NULL,
@@ -494,6 +552,10 @@ class HistoricalMarketStore:
 
                 CREATE INDEX IF NOT EXISTS idx_nxt_daily_quotes_date
                     ON nxt_daily_quotes(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_nxt_daily_eligibility_reason_date
+                    ON nxt_daily_eligibility_reason_counts(trade_date, reason_group);
+                CREATE INDEX IF NOT EXISTS idx_nxt_daily_eligibility_adjustment_date
+                    ON nxt_daily_eligibility_adjustments(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_quotes_date
                     ON krx_daily_quotes(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_futures_date
@@ -808,6 +870,254 @@ class HistoricalMarketStore:
                 status_rows,
             )
 
+    @staticmethod
+    def _replace_nxt_eligibility_for_date(
+        connection: sqlite3.Connection,
+        trading_date: date,
+        statuses: Iterable[NxtTradingStatus],
+    ) -> None:
+        date_key = trading_date.isoformat()
+        status_rows = list(statuses)
+        known_codes = {item.stock_code for item in status_rows}
+        adjustment_rows = connection.execute(
+            """
+            SELECT stock_code, stock_name, market, unavailable_reason
+            FROM nxt_daily_eligibility_adjustments
+            WHERE trade_date = ?
+            """,
+            (date_key,),
+        ).fetchall()
+        status_rows.extend(
+            NxtTradingStatus(
+                status_date=trading_date,
+                stock_code=str(row["stock_code"]),
+                stock_name=str(row["stock_name"]),
+                market=str(row["market"]),
+                tradable_market="거래불가",
+                unavailable_reason=str(row["unavailable_reason"]),
+            )
+            for row in adjustment_rows
+            if str(row["stock_code"]) not in known_codes
+        )
+        change_rows = connection.execute(
+            """
+            SELECT change_date, stock_code, stock_name, market, change_type,
+                   reason, isin, registered_at
+            FROM nxt_membership_changes
+            WHERE change_date = ?
+            ORDER BY registered_at, stock_code
+            """,
+            (date_key,),
+        ).fetchall()
+        changes = [
+            NxtChange(
+                change_date=trading_date,
+                stock_code=str(row["stock_code"]),
+                stock_name=str(row["stock_name"]),
+                market=str(row["market"]),
+                change_type=str(row["change_type"]),
+                reason=str(row["reason"]),
+                isin=str(row["isin"]),
+                registered_at=int(row["registered_at"]),
+            )
+            for row in change_rows
+        ]
+        summary, reason_counts = calculate_daily_eligibility(
+            trading_date,
+            status_rows,
+            changes,
+        )
+        updated_at = datetime.now(timezone.utc).isoformat()
+        connection.execute(
+            """
+            INSERT INTO nxt_daily_eligibility_summary (
+                trade_date, target_stock_count, tradable_stock_count,
+                unavailable_stock_count, target_kospi_count,
+                target_kosdaq_count, tradable_kospi_count,
+                tradable_kosdaq_count, inclusion_stock_count,
+                exclusion_stock_count, restriction_start_stock_count,
+                restriction_end_stock_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date) DO UPDATE SET
+                target_stock_count = excluded.target_stock_count,
+                tradable_stock_count = excluded.tradable_stock_count,
+                unavailable_stock_count = excluded.unavailable_stock_count,
+                target_kospi_count = excluded.target_kospi_count,
+                target_kosdaq_count = excluded.target_kosdaq_count,
+                tradable_kospi_count = excluded.tradable_kospi_count,
+                tradable_kosdaq_count = excluded.tradable_kosdaq_count,
+                inclusion_stock_count = excluded.inclusion_stock_count,
+                exclusion_stock_count = excluded.exclusion_stock_count,
+                restriction_start_stock_count = excluded.restriction_start_stock_count,
+                restriction_end_stock_count = excluded.restriction_end_stock_count,
+                updated_at = excluded.updated_at
+            """,
+            (
+                date_key,
+                summary.target_stock_count,
+                summary.tradable_stock_count,
+                summary.unavailable_stock_count,
+                summary.target_kospi_count,
+                summary.target_kosdaq_count,
+                summary.tradable_kospi_count,
+                summary.tradable_kosdaq_count,
+                summary.inclusion_stock_count,
+                summary.exclusion_stock_count,
+                summary.restriction_start_stock_count,
+                summary.restriction_end_stock_count,
+                updated_at,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM nxt_daily_eligibility_reason_counts WHERE trade_date = ?",
+            (date_key,),
+        )
+        connection.executemany(
+            """
+            INSERT INTO nxt_daily_eligibility_reason_counts (
+                trade_date, reason_group, reason, stock_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    date_key,
+                    item.reason_group,
+                    item.reason,
+                    item.stock_count,
+                    updated_at,
+                )
+                for item in reason_counts
+            ],
+        )
+
+    def rebuild_nxt_eligibility_history(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> int:
+        """저장된 NXT 종목 현황과 변동 원본으로 일별 선정·거래상태를 재계산합니다."""
+
+        if end_date < start_date:
+            return 0
+        with self._lock, self._connect() as connection:
+            date_rows = connection.execute(
+                """
+                SELECT DISTINCT trade_date
+                FROM nxt_daily_quotes
+                WHERE trade_date BETWEEN ? AND ?
+                ORDER BY trade_date
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+            trading_dates = [
+                date.fromisoformat(str(row["trade_date"])) for row in date_rows
+            ]
+            statuses_by_date: dict[date, list[NxtTradingStatus]] = {}
+            for trading_date in trading_dates:
+                status_rows = connection.execute(
+                    """
+                    SELECT * FROM nxt_daily_quotes
+                    WHERE trade_date = ?
+                    ORDER BY market, stock_code
+                    """,
+                    (trading_date.isoformat(),),
+                ).fetchall()
+                statuses_by_date[trading_date] = [
+                    self._nxt_status_from_row(trading_date, status_row)
+                    for status_row in status_rows
+                ]
+            change_rows = connection.execute(
+                """
+                SELECT change_date, stock_code, stock_name, market, change_type,
+                       reason, isin, registered_at
+                FROM nxt_membership_changes
+                WHERE change_date <= ?
+                ORDER BY change_date, registered_at, stock_code
+                """,
+                (end_date.isoformat(),),
+            ).fetchall()
+            changes = [
+                NxtChange(
+                    change_date=date.fromisoformat(str(row["change_date"])),
+                    stock_code=str(row["stock_code"]),
+                    stock_name=str(row["stock_name"]),
+                    market=str(row["market"]),
+                    change_type=str(row["change_type"]),
+                    reason=str(row["reason"]),
+                    isin=str(row["isin"]),
+                    registered_at=int(row["registered_at"]),
+                )
+                for row in change_rows
+            ]
+            adjustments_by_date = infer_missing_restriction_statuses(
+                trading_dates,
+                statuses_by_date,
+                changes,
+            )
+            connection.execute(
+                "DELETE FROM nxt_daily_eligibility_summary "
+                "WHERE trade_date BETWEEN ? AND ?",
+                (start_date.isoformat(), end_date.isoformat()),
+            )
+            connection.execute(
+                "DELETE FROM nxt_daily_eligibility_reason_counts "
+                "WHERE trade_date BETWEEN ? AND ?",
+                (start_date.isoformat(), end_date.isoformat()),
+            )
+            connection.execute(
+                "DELETE FROM nxt_daily_eligibility_adjustments "
+                "WHERE trade_date BETWEEN ? AND ?",
+                (start_date.isoformat(), end_date.isoformat()),
+            )
+            updated_at = datetime.now(timezone.utc).isoformat()
+            for trading_date in trading_dates:
+                adjustments = adjustments_by_date.get(trading_date, [])
+                statuses = list(statuses_by_date[trading_date])
+                statuses.extend(
+                    NxtTradingStatus(
+                        status_date=trading_date,
+                        stock_code=item.stock_code,
+                        stock_name=item.stock_name,
+                        market=item.market,
+                        tradable_market="거래불가",
+                        unavailable_reason=item.unavailable_reason,
+                    )
+                    for item in adjustments
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO nxt_daily_eligibility_adjustments (
+                        trade_date, stock_code, stock_name, market,
+                        unavailable_reason, restriction_start_date,
+                        restriction_end_date, basis, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            trading_date.isoformat(),
+                            item.stock_code,
+                            item.stock_name,
+                            item.market,
+                            item.unavailable_reason,
+                            item.restriction_start_date.isoformat(),
+                            (
+                                item.restriction_end_date.isoformat()
+                                if item.restriction_end_date
+                                else None
+                            ),
+                            item.basis,
+                            updated_at,
+                        )
+                        for item in adjustments
+                    ],
+                )
+                self._replace_nxt_eligibility_for_date(
+                    connection,
+                    trading_date,
+                    statuses,
+                )
+        return len(trading_dates)
+
     def save_historical_snapshot(
         self,
         trading_date: date,
@@ -894,6 +1204,11 @@ class HistoricalMarketStore:
             )
             self._replace_nxt_limit_hits(connection, trading_date, status_rows)
             self._replace_nxt_limit_proximity_hits(
+                connection,
+                trading_date,
+                status_rows,
+            )
+            self._replace_nxt_eligibility_for_date(
                 connection,
                 trading_date,
                 status_rows,
@@ -1012,6 +1327,11 @@ class HistoricalMarketStore:
             )
             self._replace_nxt_limit_hits(connection, trading_date, status_rows)
             self._replace_nxt_limit_proximity_hits(
+                connection,
+                trading_date,
+                status_rows,
+            )
+            self._replace_nxt_eligibility_for_date(
                 connection,
                 trading_date,
                 status_rows,
@@ -1874,6 +2194,145 @@ class HistoricalMarketStore:
                 (trading_date.isoformat(),),
             ).fetchall()
         return [self._nxt_status_from_row(trading_date, row) for row in rows]
+
+    def list_nxt_eligibility_summaries(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> list[NxtDailyEligibilitySummary]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM nxt_daily_eligibility_summary
+                WHERE trade_date BETWEEN ? AND ?
+                ORDER BY trade_date
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        return [
+            NxtDailyEligibilitySummary(
+                trade_date=date.fromisoformat(str(row["trade_date"])),
+                target_stock_count=int(row["target_stock_count"]),
+                tradable_stock_count=int(row["tradable_stock_count"]),
+                unavailable_stock_count=int(row["unavailable_stock_count"]),
+                target_kospi_count=int(row["target_kospi_count"]),
+                target_kosdaq_count=int(row["target_kosdaq_count"]),
+                tradable_kospi_count=int(row["tradable_kospi_count"]),
+                tradable_kosdaq_count=int(row["tradable_kosdaq_count"]),
+                inclusion_stock_count=int(row["inclusion_stock_count"]),
+                exclusion_stock_count=int(row["exclusion_stock_count"]),
+                restriction_start_stock_count=int(
+                    row["restriction_start_stock_count"]
+                ),
+                restriction_end_stock_count=int(row["restriction_end_stock_count"]),
+            )
+            for row in rows
+        ]
+
+    def list_nxt_eligibility_reason_counts(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> list[NxtDailyReasonCount]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT trade_date, reason_group, reason, stock_count
+                FROM nxt_daily_eligibility_reason_counts
+                WHERE trade_date BETWEEN ? AND ?
+                ORDER BY trade_date, reason_group, reason
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        return [
+            NxtDailyReasonCount(
+                trade_date=date.fromisoformat(str(row["trade_date"])),
+                reason_group=str(row["reason_group"]),
+                reason=str(row["reason"]),
+                stock_count=int(row["stock_count"]),
+            )
+            for row in rows
+        ]
+
+    def list_nxt_eligibility_adjustments(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> list[NxtEligibilityAdjustment]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT trade_date, stock_code, stock_name, market,
+                       unavailable_reason, restriction_start_date,
+                       restriction_end_date, basis
+                FROM nxt_daily_eligibility_adjustments
+                WHERE trade_date BETWEEN ? AND ?
+                ORDER BY trade_date, stock_code
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        return [
+            NxtEligibilityAdjustment(
+                trade_date=date.fromisoformat(str(row["trade_date"])),
+                stock_code=str(row["stock_code"]),
+                stock_name=str(row["stock_name"]),
+                market=str(row["market"]),
+                unavailable_reason=str(row["unavailable_reason"]),
+                restriction_start_date=date.fromisoformat(
+                    str(row["restriction_start_date"])
+                ),
+                restriction_end_date=(
+                    date.fromisoformat(str(row["restriction_end_date"]))
+                    if row["restriction_end_date"]
+                    else None
+                ),
+                basis=str(row["basis"]),
+            )
+            for row in rows
+        ]
+
+    def nxt_eligibility_history_coverage(self) -> dict[str, object]:
+        with self._lock, self._connect() as connection:
+            summary = connection.execute(
+                """
+                SELECT COUNT(*) AS trading_days, MIN(trade_date) AS first_date,
+                       MAX(trade_date) AS last_date,
+                       SUM(inclusion_stock_count) AS inclusions,
+                       SUM(exclusion_stock_count) AS exclusions,
+                       SUM(restriction_start_stock_count) AS restrictions,
+                       SUM(restriction_end_stock_count) AS restriction_releases
+                FROM nxt_daily_eligibility_summary
+                """
+            ).fetchone()
+            reason_rows = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM nxt_daily_eligibility_reason_counts"
+                ).fetchone()[0]
+            )
+            adjustment_rows = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM nxt_daily_eligibility_adjustments"
+                ).fetchone()[0]
+            )
+        return {
+            "trading_days": int(summary["trading_days"] or 0),
+            "first_date": (
+                date.fromisoformat(str(summary["first_date"]))
+                if summary["first_date"]
+                else None
+            ),
+            "last_date": (
+                date.fromisoformat(str(summary["last_date"]))
+                if summary["last_date"]
+                else None
+            ),
+            "inclusions": int(summary["inclusions"] or 0),
+            "exclusions": int(summary["exclusions"] or 0),
+            "restrictions": int(summary["restrictions"] or 0),
+            "restriction_releases": int(summary["restriction_releases"] or 0),
+            "reason_rows": reason_rows,
+            "adjustment_rows": adjustment_rows,
+        }
 
     def load_historical_snapshot(
         self,
