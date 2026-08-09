@@ -176,6 +176,17 @@ def infer_missing_restriction_statuses(
                     item,
                 )
                 continue
+            if group in {"편입", "편출"}:
+                if active is not None:
+                    add_period(
+                        active[0],
+                        item.change_date,
+                        active[1],
+                        active[2],
+                        "거래불가 지정 후 실제 선정 변동",
+                    )
+                    active = None
+                continue
             if group != "거래불가 해제":
                 continue
             release_reason = restriction_reason_from_change(item.reason)

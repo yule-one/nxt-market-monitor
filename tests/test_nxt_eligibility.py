@@ -80,6 +80,18 @@ def test_infers_release_only_gap_from_last_present_trading_day() -> None:
     assert inferred[dates[2]][0].basis == "해제 변동 전 원본 누락기간 역산"
 
 
+def test_actual_exclusion_ends_open_restriction_period() -> None:
+    dates = [date(2025, 6, 19), date(2025, 6, 20), date(2025, 9, 22), date(2025, 9, 23)]
+    statuses = {trading_date: [] for trading_date in dates}
+    changes = [
+        _change(dates[0], "편출", "투자경고/위험 지정"),
+        _change(dates[2], "편출", "시장관리"),
+    ]
+    inferred = infer_missing_restriction_statuses(dates, statuses, changes)
+    assert set(inferred) == {dates[0], dates[1]}
+    assert dates[3] not in inferred
+
+
 def test_daily_summary_counts_inferred_unavailable_as_target() -> None:
     day = date(2025, 5, 20)
     available = _status(day, "111111")
