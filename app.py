@@ -13,6 +13,7 @@ import streamlit as st
 from src.analytics import (
     build_daily_metrics,
     build_daily_nxt_metrics_from_counts,
+    classify_nxt_change,
     disclosures_to_frame,
     match_disclosures_to_nxt_status,
     nxt_changes_to_frame,
@@ -64,7 +65,7 @@ from src.nxt_change_store import (
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 7
-HISTORICAL_STORE_RUNTIME_VERSION = 10
+HISTORICAL_STORE_RUNTIME_VERSION = 11
 NXT_LIMIT_PROXIMITY_TICKS = 3
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
@@ -370,6 +371,7 @@ def get_historical_market_store() -> HistoricalMarketStore:
             "nxt_limit_hit_coverage",
             "load_nxt_limit_proximity_times",
             "load_nxt_limit_proximity_hits",
+            "list_nxt_eligibility_summaries",
         )
     ):
         _get_historical_market_store.clear()
@@ -3285,10 +3287,13 @@ def nxt_changes_page() -> None:
     st.title("NXT 정규시장 종목 변동내역")
     start_date, end_date = _date_controls("nxt_changes", default_days=30)
     changes = load_nxt_changes(start_date, end_date)
-    stored_metrics = get_historical_market_store().list_metrics(start_date, end_date)
+    eligibility = get_historical_market_store().list_nxt_eligibility_summaries(
+        start_date,
+        end_date,
+    )
     metrics = build_daily_nxt_metrics_from_counts(
         changes,
-        {item.trade_date: item.nxt_stock_count for item in stored_metrics},
+        {item.trade_date: item.target_stock_count for item in eligibility},
         start_date,
         end_date,
     )
@@ -3315,7 +3320,7 @@ def nxt_changes_page() -> None:
             item.stock_code
             for item in changes
             if start_date <= item.change_date <= end_date
-            and item.change_type == "편입"
+            and classify_nxt_change(item) == "편입"
         }
     )
     period_exclusions = len(
@@ -3323,7 +3328,7 @@ def nxt_changes_page() -> None:
             item.stock_code
             for item in changes
             if start_date <= item.change_date <= end_date
-            and item.change_type == "편출"
+            and classify_nxt_change(item) == "편출"
         }
     )
     columns = st.columns(4)

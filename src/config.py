@@ -63,13 +63,24 @@ NXT_TRADING_STATUS_PAGE_URL = (
     "https://www.nextrade.co.kr/menu/transactionStatusMain/menuList.do"
 )
 
-# 이 사유의 편출은 종목 선정 자체의 종료가 아니라 시장조치에 따른 일시 제한으로 봅니다.
-TEMPORARY_EXCLUSION_KEYWORDS = (
-    "시장관리",
-    "관리종목",
-    "투자주의환기",
+# NXT 변동 원본이 편출·편입으로 표시하더라도 종목 선정의 변경이 아니라
+# 지정 기간의 거래제한 시작·해제로 분류해야 하는 사유입니다.
+TRADING_RESTRICTION_START_KEYWORDS = (
     "투자경고",
     "투자위험",
     "단기과열",
     "거래정지",
+    "시가기준가",
 )
+
+TRADING_RESTRICTION_END_KEYWORDS = (
+    "투자경고/위험 해제",
+    "투자경고 해제",
+    "투자위험 해제",
+    "단기과열 해제",
+    "거래정지 해제",
+    "시가기준가 해제",
+)
+
+# 기존 import 호환용 별칭입니다.
+TEMPORARY_EXCLUSION_KEYWORDS = TRADING_RESTRICTION_START_KEYWORDS

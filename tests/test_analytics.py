@@ -5,6 +5,7 @@ from src.analytics import (
     build_daily_nxt_metrics,
     build_daily_nxt_metrics_from_counts,
     build_nxt_state_as_of,
+    classify_nxt_change,
     disclosures_to_frame,
     extract_state_transitions,
     is_preferred_share_notice,
@@ -73,15 +74,24 @@ def trading_status(
 def test_nxt_state_replays_add_exclude_readd() -> None:
     events = [
         nxt_change(date(2025, 3, 4), "123450", "편입", "특별변경"),
-        nxt_change(date(2025, 3, 5), "123450", "편출", "시장관리"),
-        nxt_change(date(2025, 3, 6), "123450", "편입", "시장관리해소"),
+        nxt_change(date(2025, 3, 5), "123450", "편출", "투자경고/위험 지정"),
+        nxt_change(date(2025, 3, 6), "123450", "편입", "투자경고/위험 해제"),
     ]
     excluded = build_nxt_state_as_of(events, date(2025, 3, 5))["123450"]
     assert not excluded.is_tradable
     assert excluded.is_temporary_exclusion
+    assert excluded.membership_label == "거래불가 (2025-03-05)"
     readded = build_nxt_state_as_of(events, date(2025, 3, 6))["123450"]
     assert readded.is_tradable
     assert not readded.is_temporary_exclusion
+
+
+def test_market_management_is_real_exclusion() -> None:
+    event = nxt_change(date(2025, 3, 5), "123450", "편출", "시장관리")
+    state = build_nxt_state_as_of([event], date(2025, 3, 5))["123450"]
+    assert not state.is_tradable
+    assert not state.is_temporary_exclusion
+    assert state.membership_label == "편출 (2025-03-05)"
 
 
 def test_disclosure_matches_official_unavailable_nxt_status() -> None:
@@ -136,8 +146,28 @@ def test_nxt_change_frame_uses_user_facing_column_names() -> None:
     )
     assert frame.iloc[0]["상장시장"] == "KOSDAQ"
     assert frame.iloc[0]["변동내역"] == "편출"
+    assert frame.iloc[0]["원본변동내역"] == "편출"
     assert frame.iloc[0]["변동사유"] == "시장관리"
     assert not {"시장", "변동", "사유"}.intersection(frame.columns)
+
+
+def test_nxt_change_reclassifies_temporary_trading_restrictions() -> None:
+    warning = nxt_change(
+        date(2025, 4, 30),
+        "123450",
+        "편출",
+        "투자경고/위험 지정",
+    )
+    released = nxt_change(
+        date(2025, 5, 2),
+        "123450",
+        "편입",
+        "투자경고/위험 해제",
+    )
+    assert classify_nxt_change(warning) == "거래불가"
+    assert classify_nxt_change(released) == "거래불가 해제"
+    frame = nxt_changes_to_frame([warning, released])
+    assert frame["변동내역"].tolist() == ["거래불가", "거래불가 해제"]
 
 
 def test_preferred_share_notice_is_not_joined_to_common_share() -> None:
@@ -265,6 +295,34 @@ def test_daily_nxt_metrics_uses_stored_stock_counts() -> None:
     assert first["당일 편출 종목수"] == 0
     assert second["NXT 종목수"] == 589
     assert second["당일 편출 종목수"] == 1
+
+
+def test_daily_nxt_metrics_excludes_restrictions_from_membership_changes() -> None:
+    events = [
+        nxt_change(
+            date(2025, 3, 5),
+            "123450",
+            "편출",
+            "단기과열 지정",
+        ),
+        nxt_change(
+            date(2025, 3, 6),
+            "123450",
+            "편입",
+            "단기과열 해제",
+        ),
+    ]
+    metrics = build_daily_nxt_metrics_from_counts(
+        events,
+        {
+            date(2025, 3, 5): 590,
+            date(2025, 3, 6): 590,
+        },
+        date(2025, 3, 5),
+        date(2025, 3, 6),
+    )
+    assert metrics["당일 편출 종목수"].sum() == 0
+    assert metrics["당일 편입 종목수"].sum() == 0
 
 
 def test_daily_metrics_uses_official_warning_period() -> None:

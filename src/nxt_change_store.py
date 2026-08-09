@@ -229,6 +229,14 @@ class NxtChangeStore:
                     (cursor.isoformat(), fetched_at, counts.get(cursor, 0)),
                 )
                 cursor += timedelta(days=1)
+        # 변동 원본이 갱신된 날짜의 파생 선정·거래상태도 함께 다시 계산합니다.
+        # 지역 import로 저장소 모듈 간 초기화 순환을 피합니다.
+        from src.historical_market import HistoricalMarketStore
+
+        HistoricalMarketStore(self.path).rebuild_nxt_eligibility_history(
+            start_date,
+            end_date,
+        )
 
     def try_claim(self, start_date: date, end_date: date) -> bool:
         now = datetime.now(timezone.utc)

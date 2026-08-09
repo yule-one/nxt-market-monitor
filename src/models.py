@@ -110,6 +110,8 @@ class NxtStockState:
     def membership_label(self) -> str:
         if self.is_tradable:
             return "매매가능"
+        if self.is_temporary_exclusion:
+            return f"거래불가 ({self.last_change_date:%Y-%m-%d})"
         return f"편출 ({self.last_change_date:%Y-%m-%d})"
 
 
