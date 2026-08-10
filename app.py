@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from html import escape
 
@@ -447,6 +448,15 @@ def get_nxt_minute_lookup_gate(runtime_version: int) -> NxtMinuteLookupGate:
         failure_max_seconds=300,
         empty_retry_seconds=60,
         success_cooldown_seconds=5,
+    )
+
+
+@st.cache_resource
+def get_nxt_minute_lookup_executor(runtime_version: int) -> ThreadPoolExecutor:
+    _ = runtime_version
+    return ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="nxt-minute-lookup",
     )
 
 
@@ -2234,6 +2244,80 @@ def _nxt_limit_proximity_rows(
     )
 
 
+def _fetch_and_store_nxt_limit_hit_times(
+    client: KisRestClient,
+    lookup_gate: NxtMinuteLookupGate,
+    store: HistoricalMarketStore,
+    lookup_key: tuple[str, str],
+    symbol: str,
+    selected_date: date,
+    targets: dict[str, int],
+    end_time: str,
+) -> None:
+    try:
+        found_times = client.fetch_nxt_limit_hit_times(
+            symbol,
+            selected_date,
+            targets,
+            end_time=end_time,
+        )
+        symbol_values = {
+            (symbol, direction): hit_time
+            for direction, hit_time in found_times.items()
+        }
+        if symbol_values:
+            store.save_nxt_limit_hit_times(selected_date, symbol_values)
+    except Exception as exc:
+        lookup_gate.fail(lookup_key, str(exc))
+        return
+    lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
+
+
+def _fetch_and_store_nxt_limit_proximity_times(
+    client: KisRestClient,
+    lookup_gate: NxtMinuteLookupGate,
+    store: HistoricalMarketStore,
+    lookup_key: tuple[str, str],
+    symbol: str,
+    selected_date: date,
+    targets: tuple[tuple[str, int, str], ...],
+    end_time: str,
+) -> None:
+    try:
+        bars = client.fetch_nxt_minute_bars(
+            symbol,
+            selected_date,
+            end_time=end_time,
+        )
+        minute_prices = [
+            (
+                bar.trade_time,
+                bar.open_price,
+                bar.high_price,
+                bar.low_price,
+                bar.close_price,
+            )
+            for bar in bars
+        ]
+        symbol_values: dict[tuple[str, str], str] = {}
+        for direction, limit_price, market in targets:
+            hit_time = first_limit_proximity_time(
+                minute_prices,
+                limit_price,
+                direction,
+                max_ticks=NXT_LIMIT_PROXIMITY_TICKS,
+                market=market,
+            )
+            if hit_time is not None:
+                symbol_values[(symbol, direction)] = hit_time
+        if symbol_values:
+            store.save_nxt_limit_proximity_times(selected_date, symbol_values)
+    except Exception as exc:
+        lookup_gate.fail(lookup_key, str(exc))
+        return
+    lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
+
+
 def _resolve_nxt_limit_hit_times(
     selected_date: date,
     hit_rows: pd.DataFrame,
@@ -2297,37 +2381,30 @@ def _resolve_nxt_limit_hit_times(
         KIS_SHARED_CLIENT_RUNTIME_VERSION,
     )
     lookup_gate = get_nxt_minute_lookup_gate(KIS_SHARED_CLIENT_RUNTIME_VERSION)
-    errors: list[str] = []
+    executor = get_nxt_minute_lookup_executor(KIS_SHARED_CLIENT_RUNTIME_VERSION)
+    scheduled_count = 0
     for symbol, targets in missing_by_symbol.items():
         lookup_key = (selected_date.isoformat(), symbol)
         permit = lookup_gate.claim(lookup_key)
         if not permit.allowed:
             continue
         try:
-            found_times = client.fetch_nxt_limit_hit_times(
+            executor.submit(
+                _fetch_and_store_nxt_limit_hit_times,
+                client,
+                lookup_gate,
+                store,
+                lookup_key,
                 symbol,
                 selected_date,
                 dict(targets),
-                end_time=end_time,
+                end_time,
             )
         except Exception as exc:
-            retry_seconds = lookup_gate.fail(lookup_key, str(exc))
-            errors.append(
-                f"{symbol}: 분봉 서버 오류 · {retry_seconds}초 후 자동 재시도"
-            )
+            lookup_gate.fail(lookup_key, str(exc))
             continue
-        symbol_values: dict[tuple[str, str], str] = {}
-        for direction, hit_time in found_times.items():
-            symbol_values[(symbol, direction)] = hit_time
-        if symbol_values:
-            store.save_nxt_limit_hit_times(selected_date, symbol_values)
-            resolved.update(symbol_values)
-        lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
-    note = (
-        f"일부 종목의 최초 기록시각을 확인하지 못했습니다: {errors[0]}"
-        if errors
-        else None
-    )
+        scheduled_count += 1
+    note = "최초 기록시각을 순차 확인 중입니다." if scheduled_count else None
     return resolved, note
 
 
@@ -2398,54 +2475,30 @@ def _resolve_nxt_limit_proximity_times(
         KIS_SHARED_CLIENT_RUNTIME_VERSION,
     )
     lookup_gate = get_nxt_minute_lookup_gate(KIS_SHARED_CLIENT_RUNTIME_VERSION)
-    errors: list[str] = []
+    executor = get_nxt_minute_lookup_executor(KIS_SHARED_CLIENT_RUNTIME_VERSION)
+    scheduled_count = 0
     for symbol, targets in missing_by_symbol.items():
         lookup_key = (selected_date.isoformat(), symbol)
         permit = lookup_gate.claim(lookup_key)
         if not permit.allowed:
             continue
         try:
-            bars = client.fetch_nxt_minute_bars(
+            executor.submit(
+                _fetch_and_store_nxt_limit_proximity_times,
+                client,
+                lookup_gate,
+                store,
+                lookup_key,
                 symbol,
                 selected_date,
-                end_time=end_time,
+                tuple(targets),
+                end_time,
             )
         except Exception as exc:
-            retry_seconds = lookup_gate.fail(lookup_key, str(exc))
-            errors.append(
-                f"{symbol}: 분봉 서버 오류 · {retry_seconds}초 후 자동 재시도"
-            )
+            lookup_gate.fail(lookup_key, str(exc))
             continue
-        minute_prices = [
-            (
-                bar.trade_time,
-                bar.open_price,
-                bar.high_price,
-                bar.low_price,
-                bar.close_price,
-            )
-            for bar in bars
-        ]
-        symbol_values: dict[tuple[str, str], str] = {}
-        for direction, limit_price, market in targets:
-            hit_time = first_limit_proximity_time(
-                minute_prices,
-                limit_price,
-                direction,
-                max_ticks=NXT_LIMIT_PROXIMITY_TICKS,
-                market=market,
-            )
-            if hit_time is not None:
-                symbol_values[(symbol, direction)] = hit_time
-        if symbol_values:
-            store.save_nxt_limit_proximity_times(selected_date, symbol_values)
-            resolved.update(symbol_values)
-        lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
-    note = (
-        f"일부 종목의 최초 기록시각을 확인하지 못했습니다: {errors[0]}"
-        if errors
-        else None
-    )
+        scheduled_count += 1
+    note = "최초 기록시각을 순차 확인 중입니다." if scheduled_count else None
     return resolved, note
 
 
