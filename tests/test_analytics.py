@@ -12,6 +12,7 @@ from src.analytics import (
     match_disclosures_to_nxt_status,
     nxt_changes_to_frame,
     nxt_trading_status_to_frame,
+    summarize_nxt_membership_flow,
 )
 from src.models import Disclosure, NxtChange, NxtTradingStatus, StatusPeriod
 
@@ -315,6 +316,30 @@ def test_daily_nxt_metrics_uses_stored_stock_counts() -> None:
     assert first["당일 편출 종목수"] == 0
     assert second["NXT 종목수"] == 589
     assert second["당일 편출 종목수"] == 1
+
+
+def test_membership_flow_includes_launch_day_additions_in_net_change() -> None:
+    launch_date = date(2025, 3, 4)
+    following_date = date(2025, 3, 5)
+    events = [
+        nxt_change(launch_date, f"{index:06d}", "편입", "특별변경")
+        for index in range(10)
+    ]
+    events.extend(
+        [
+            nxt_change(following_date, "100001", "편입", "특별변경"),
+            nxt_change(following_date, "000001", "편출", "정기변경"),
+        ]
+    )
+    metrics = build_daily_nxt_metrics_from_counts(
+        events,
+        {launch_date: 10, following_date: 10},
+        launch_date,
+        following_date,
+    )
+
+    assert metrics.iloc[0]["당일 편입 종목수"] == 10
+    assert summarize_nxt_membership_flow(metrics) == (11, 1, 10)
 
 
 def test_daily_nxt_metrics_excludes_restrictions_from_membership_changes() -> None:

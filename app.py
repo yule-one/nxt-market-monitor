@@ -21,6 +21,7 @@ from src.analytics import (
     nxt_changes_to_frame,
     nxt_unavailability_events_to_frame,
     nxt_trading_status_to_frame,
+    summarize_nxt_membership_flow,
 )
 from src.cache import ResponseCache
 from src.config import (
@@ -961,53 +962,51 @@ def _render_universe_counts(
     )
 
 
-def _render_dashboard_notices(*, historical: bool) -> None:
-    if historical:
-        notices = [
-            "NXT 공식 일별 종가와 KRX OPEN API 확정 일별 값을 DB에 저장해 표시합니다.",
-            (
-                "KRX 거래량·거래대금은 세션 구분이 없는 확정 일별 누적값입니다. "
-                "정규장의 일반·대량·바스켓 매매와 시간외 종가·단일가·대량·바스켓 "
-                "매매가 합산돼 G1만 따로 분리할 수 없습니다."
-            ),
-            (
-                "KRX 합계는 KOSPI·KOSDAQ 대표지수 누적값의 합입니다. 전종목 합계가 "
-                "아니며 외국주권·DR은 포함되지 않습니다. 개별종목 값은 해당 종목의 "
-                "확정 일별 누적값입니다."
-            ),
-            "과거 시가총액은 KRX OPEN API가 제공하는 MKTCAP 원본값입니다.",
-            "현재 KRX_KEY는 선물 일별매매정보 권한이 없어 과거 선물값은 표시하지 않습니다.",
-        ]
-    else:
-        notices = [
-            (
-                "당일 수치는 실시간 값이 아니며, 최대 1분 정도의 오차가 있을 수 "
-                "있습니다. 또한, API의 조회 건수와 호출 제한 때문에 나누어 순차 "
-                "조회하므로 종목마다 수신 시각이 다를 수 있습니다."
-            ),
-            (
-                "KRX 거래량·거래대금 합계는 API가 천주·백만원 단위로 제공한 값을 "
-                "주·원 단위로 환산한 값이며, 하위 단위 처리 방식이 공개되지 않아 "
-                "정확한 값이 아닙니다."
-            ),
-            (
-                "장중 KRX 거래량·거래대금 값은 조회 시점 누적값입니다. 장 종료 후 "
-                "확정 일별 값에는 정규시장의 일반·대량·바스켓 매매와 시간외 "
-                "종가·단일가·대량·바스켓 매매가 합산됩니다. 해당 값에는 "
-                "외국주권·DR 거래분은 포함되어 있지 않습니다."
-            ),
-            (
-                "NXT 등락률은 현재가·비교가격·상장주식수가 모두 있는 종목만 "
-                "계산합니다. 기준가격이 없으면 전일 KRX 종가를 사용합니다."
-            ),
-            "시가총액은 KRX 현재가와 상장주식수를 곱한 값입니다.",
-        ]
+def _render_notice_items(notices: tuple[str, ...] | list[str]) -> None:
     notice_items = "".join(f"<li>{escape(item)}</li>" for item in notices)
     with st.expander("유의사항", expanded=False):
         st.markdown(
             f'<div class="dashboard-notice"><ul>{notice_items}</ul></div>',
             unsafe_allow_html=True,
         )
+
+
+def _render_dashboard_notices(*, historical: bool) -> None:
+    if historical:
+        notices = [
+            "과거 화면은 NXT 공식 일별 시세와 KRX OPEN API 확정값을 DB에서 조회합니다.",
+            (
+                "KRX 거래량·거래대금은 세션 구분이 없는 확정 일별 누적값입니다. "
+                "정규장과 시간외 일반·대량·바스켓 매매가 합산되므로 G1만 분리할 수 없습니다."
+            ),
+            (
+                "KRX 합계는 KOSPI·KOSDAQ 대표지수 누적값의 합으로 전종목 합계가 아니며, "
+                "외국주권·DR은 포함하지 않습니다."
+            ),
+            "과거 시가총액은 KRX OPEN API가 제공하는 확정값입니다.",
+            "지수·선물·환율은 제공처와 갱신 시각이 달라 같은 시점의 값이 아닐 수 있습니다.",
+        ]
+    else:
+        notices = [
+            (
+                "당일 수치는 전 종목을 나누어 순차 조회한 누적값으로, 종목별 수신 시각이 "
+                "다르며 최대 1분 정도 늦을 수 있습니다."
+            ),
+            (
+                "KRX 거래량·거래대금 합계는 API가 천주·백만원 단위로 제공한 값을 "
+                "주·원으로 환산한 참고값입니다. 하위 단위의 반올림·절사 방식은 공개되지 않았습니다."
+            ),
+            (
+                "장중 KRX 값은 조회 시점 누적값입니다. 확정 일별 값에는 정규장과 시간외 "
+                "일반·대량·바스켓 매매가 합산되며 외국주권·DR은 포함하지 않습니다."
+            ),
+            (
+                "NXT 가중 등락률은 현재가·비교가격·상장주식수가 모두 있는 종목만 계산하며, "
+                "기준가격이 없으면 전일 KRX 종가를 사용합니다."
+            ),
+            "시가총액은 KRX 현재가와 상장주식수를 곱한 값입니다.",
+        ]
+    _render_notice_items(notices)
 
 
 @st.fragment(run_every="2s")
@@ -2018,17 +2017,24 @@ def market_history_page() -> None:
         )
     )
     st.dataframe(table, hide_index=True, use_container_width=True, height=700)
-    with st.expander("유의사항", expanded=False):
-        st.markdown(
-            '<div class="dashboard-notice"><ul>'
-            "<li>이 화면은 API를 직접 호출하지 않고 SQLite에 저장된 값만 조회합니다.</li>"
-            "<li>NXT 지수는 2025-04-01을 100으로 두고 NXT 가중 등락률을 거래일별로 연속 적용한 참고지수입니다.</li>"
-            "<li>KRX TMI는 KRX OPEN API 종가, 달러-원은 KIS의 KMB 환율을 사용합니다.</li>"
-            "<li>확정일의 KRX 합계는 KOSPI·KOSDAQ 대표지수 누적값으로, 외국주권·DR은 제외됩니다.</li>"
-            "<li>당일 누적 행은 아직 확정되지 않은 값이며 기본 대시보드의 전종목 갱신 완료 때 갱신됩니다.</li>"
-            "</ul></div>",
-            unsafe_allow_html=True,
-        )
+    _render_notice_items(
+        [
+            "이 화면은 외부 API를 호출하지 않고 SQLite에 저장된 값만 조회합니다.",
+            (
+                "NXT 지수는 2025-04-01을 100으로 두고 시가총액 가중 등락률을 "
+                "거래일별로 연속 적용한 참고지수입니다."
+            ),
+            "KRX TMI는 KRX OPEN API 종가, 달러-원은 00증권의 KMB 환율을 사용합니다.",
+            (
+                "KRX 합계는 KOSPI·KOSDAQ 대표지수 누적값의 합으로 전종목 합계가 아니며, "
+                "외국주권·DR은 포함하지 않습니다."
+            ),
+            (
+                "당일 누적 행은 확정 전 참고값입니다. 확정값은 데이터 제공처 갱신 후 "
+                "다음 저장 작업에서 반영됩니다."
+            ),
+        ]
+    )
     _render_history_market_charts(frame)
 
 
@@ -2592,6 +2598,8 @@ def _render_limit_summary(
 def _limit_price_with_rate_html(
     price: object,
     reference_price: object,
+    *,
+    colorize_rate: bool = True,
 ) -> str:
     if price is None or pd.isna(price):
         return "-"
@@ -2613,10 +2621,9 @@ def _limit_price_with_rate_html(
     else:
         css_class = "limit-rate-neutral"
         rate_text = "0.00%"
-    return (
-        f"{price_text} "
-        f'<span class="{css_class}">({escape(rate_text)})</span>'
-    )
+    if not colorize_rate:
+        return f"{price_text} ({escape(rate_text)})"
+    return f'{price_text} <span class="{css_class}">({escape(rate_text)})</span>'
 
 
 def _render_nxt_limit_table(hit_rows: pd.DataFrame) -> None:
@@ -2721,14 +2728,13 @@ def _render_nxt_limit_result(
 
 
 def _render_nxt_limit_notice() -> None:
-    with st.expander("유의사항", expanded=False):
-        st.markdown(
-            '<div class="dashboard-notice"><ul>'
-            "<li>장중의 종가는 현재가를 뜻합니다. 기록시점은 시가 또는 "
-            "NXT 분봉의 최초 기록시각입니다.</li>"
-            "</ul></div>",
-            unsafe_allow_html=True,
-        )
+    _render_notice_items(
+        [
+            "장중 종가는 현재가를 뜻하며 확정 종가가 아닙니다.",
+            "기록시점은 시가 또는 NXT 분봉에서 확인한 최초 상·하한가 기록시각입니다.",
+            "분봉 보관범위를 지난 과거 일자는 시가 외 기록시각이 없을 수 있습니다.",
+        ]
+    )
 
 
 @st.fragment(run_every="2s")
@@ -2907,14 +2913,14 @@ def _render_nxt_limit_proximity_table(proximity_rows: pd.DataFrame) -> None:
         "종목코드",
         "종목명",
         "상장시장",
-        "상·하한가 근접 구분",
-        "도달시점",
-        "잔여틱",
         "기준가격",
         "상한가",
         "하한가",
         "시가",
         "최근접가격",
+        "상·하한가 근접 구분",
+        "도달시점",
+        "잔여틱",
         "종가",
     ]
     body_rows: list[str] = []
@@ -2930,14 +2936,14 @@ def _render_nxt_limit_proximity_table(proximity_rows: pd.DataFrame) -> None:
             f'<td class="center">{escape(str(item.get("종목코드") or "-"))}</td>'
             f'<td class="left">{escape(str(item.get("종목명") or "-"))}</td>'
             f'<td class="center">{escape(str(item.get("상장시장") or "-"))}</td>'
+            f'<td class="right">{escape(_format_price(reference_price))}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("상한가"), reference_price, colorize_rate=False)}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("하한가"), reference_price, colorize_rate=False)}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("시가"), reference_price)}</td>'
+            f'<td class="right">{_limit_price_with_rate_html(item.get("최근접가격"), reference_price)}</td>'
             f'<td class="center {direction_class}">{escape(direction_text)}</td>'
             f'<td class="center">{escape(str(item.get("근접시점") or "-"))}</td>'
             f'<td class="center {direction_class}">{escape(distance_text)}</td>'
-            f'<td class="right">{escape(_format_price(reference_price))}</td>'
-            f'<td class="right">{_limit_price_with_rate_html(item.get("상한가"), reference_price)}</td>'
-            f'<td class="right">{_limit_price_with_rate_html(item.get("하한가"), reference_price)}</td>'
-            f'<td class="right">{_limit_price_with_rate_html(item.get("시가"), reference_price)}</td>'
-            f'<td class="right">{_limit_price_with_rate_html(item.get("최근접가격"), reference_price)}</td>'
             f'<td class="right">{_limit_price_with_rate_html(item.get("종가"), reference_price)}</td>'
             "</tr>"
         )
@@ -3000,18 +3006,23 @@ def _render_nxt_limit_proximity_result(
 
 
 def _render_nxt_limit_proximity_notice() -> None:
-    with st.expander("유의사항", expanded=False):
-        st.markdown(
-            '<div class="dashboard-notice"><ul>'
-            "<li>근접 종목은 상한가 아래 또는 하한가 위 0~3틱 범위에 "
-            "도달한 종목입니다. 잔여틱이 0틱인 경우는 상·하한가 종목을 "
-            "의미합니다.</li>"
-            "<li>가격대 경계를 넘을 때는 각 가격대의 호가가격단위를 순서대로 "
-            "적용합니다. 잔여틱은 최근접가격과 상·하한가 사이의 호가 수입니다.</li>"
-            "<li>장중의 종가는 현재가를 뜻합니다.</li>"
-            "</ul></div>",
-            unsafe_allow_html=True,
-        )
+    _render_notice_items(
+        [
+            (
+                "근접 종목은 상한가 아래 또는 하한가 위 0~3틱 범위에 진입한 종목입니다. "
+                "잔여틱 0틱은 상·하한가 기록 종목입니다."
+            ),
+            (
+                "가격대 경계를 넘으면 구간별 호가가격단위를 차례로 적용합니다. "
+                "잔여틱은 최근접가격에서 상·하한가까지 남은 호가 수입니다."
+            ),
+            (
+                "도달시점은 시가 또는 NXT 분봉에서 확인한 최초 진입시각입니다. "
+                "분봉 보관범위를 지난 과거 일자는 시가 외 시각이 없을 수 있습니다."
+            ),
+            "장중 종가는 현재가를 뜻하며 확정 종가가 아닙니다.",
+        ]
+    )
 
 
 @st.fragment(run_every="2s")
@@ -3296,6 +3307,20 @@ def _selected_disclosure_categories(selected_labels: list[str] | None) -> list[s
     return selected_specific or list(CATEGORY_CODES)
 
 
+def _render_disclosure_notice() -> None:
+    _render_notice_items(
+        [
+            "조회 결과는 선택 기간에 발생한 KIND 공시이며 현재 시장조치 상태를 뜻하지 않습니다.",
+            "공시일의 NXT 매매체결대상 종목과 일치하는 공시만 표시합니다.",
+            (
+                "공시 구분은 공시 제목과 KIND 분류를 기준으로 정리합니다. "
+                "복합 공시나 정정 공시는 원문을 함께 확인해야 합니다."
+            ),
+            "거래가능시장과 거래불가사유는 해당 공시일의 NXT 거래현황 값입니다.",
+        ]
+    )
+
+
 def disclosure_page() -> None:
     st.title("NXT 정규시장 종목의 KRX 시장조치 현황")
     force_refresh = _refresh_control("refresh_disclosures")
@@ -3322,6 +3347,7 @@ def disclosure_page() -> None:
         }
     if query_state_key not in st.session_state:
         st.info("조회 조건을 선택한 후 조회 버튼을 눌러주세요.")
+        _render_disclosure_notice()
         return
     applied_query = st.session_state[query_state_key]
     query_start_date = applied_query["start_date"]
@@ -3395,6 +3421,10 @@ def disclosure_page() -> None:
             showlegend=False, margin=dict(l=10, r=10, t=50, b=10)
         )
         st.plotly_chart(chart, use_container_width=True)
+
+    _render_disclosure_notice()
+
+
 def nxt_stocks_page() -> None:
     st.title("NXT 정규시장 종목 현황")
     force_refresh = _refresh_control("refresh_nxt_stocks")
@@ -3513,28 +3543,25 @@ def nxt_changes_page() -> None:
         return
 
     latest = metrics.iloc[-1]
-    first = metrics.iloc[0]
-    period_additions = len(
-        {
-            item.stock_code
-            for item in membership_changes
-            if classify_nxt_change(item) == "편입"
-        }
-    )
-    period_exclusions = len(
-        {
-            item.stock_code
-            for item in membership_changes
-            if classify_nxt_change(item) == "편출"
-        }
+    period_additions, period_exclusions, period_net_change = (
+        summarize_nxt_membership_flow(metrics)
     )
     columns = st.columns(4)
     columns[0].metric("NXT 종목수", f"{int(latest['NXT 종목수']):,}")
-    columns[1].metric("조회기간 편입종목수", f"{period_additions:,}")
-    columns[2].metric("조회기간 편출종목수", f"{period_exclusions:,}")
+    columns[1].metric(
+        "조회기간 편입종목수",
+        f"{period_additions:,}",
+        help="조회기간의 일별 편입 건수 합계입니다. 같은 종목의 재편입은 다시 집계합니다.",
+    )
+    columns[2].metric(
+        "조회기간 편출종목수",
+        f"{period_exclusions:,}",
+        help="조회기간의 일별 편출 건수 합계입니다. 같은 종목의 재편출은 다시 집계합니다.",
+    )
     columns[3].metric(
         "NXT 종목수 증감",
-        f"{int(latest['NXT 종목수'] - first['NXT 종목수']):+,}",
+        f"{period_net_change:+,}",
+        help="조회기간의 일별 편입 종목수 합계에서 편출 종목수 합계를 뺀 값입니다.",
     )
 
     summary_tab, detail_tab, unavailable_tab = st.tabs(
@@ -3661,6 +3688,28 @@ def nxt_changes_page() -> None:
         _format_chart_date_axis(state_chart)
         st.plotly_chart(state_chart, use_container_width=True)
 
+    _render_notice_items(
+        [
+            (
+                "2025-03-04 최초 10종목은 '최초' 사유의 편입으로 집계합니다. "
+                "NXT 종목수 증감은 조회기간 편입 합계에서 편출 합계를 뺀 값입니다."
+            ),
+            (
+                "종목별 변동내역은 실제 매매체결대상 편입·편출만 표시합니다. "
+                "거래불가 지정·해제는 거래불가 현황에서 별도로 확인합니다."
+            ),
+            (
+                "거래불가 현황은 NXT 거래현황을 우선 사용하고, 사유 제공 전 구간은 "
+                "종목 변동내역으로 보완합니다."
+            ),
+            (
+                "공식 변동내역 없이 명단에서 사라지거나 추가된 종목은 일별 대상 명단과 "
+                "공식 안내를 대사해 보정하며, 보정 여부와 근거를 함께 표시합니다."
+            ),
+            "이 화면은 외부 API를 호출하지 않고 SQLite에 저장된 값만 조회합니다.",
+        ]
+    )
+
 
 def krx_market_actions_page() -> None:
     st.title("KRX 시장조치")
@@ -3762,15 +3811,14 @@ def main() -> None:
             icon="🔁",
             default=True,
         ),
-        st.Page(nxt_price_limits_page, title="NXT 상·하한가 종목 현황", icon="↕️"),
         st.Page(
             nxt_price_limit_proximity_page,
             title="NXT 상·하한가 근접 종목 현황",
             icon="🎯",
         ),
+        st.Page(nxt_changes_page, title="NXT 정규시장 종목 변동내역", icon="🔄"),
         st.Page(market_history_page, title="NXT·KRX 일별 거래 추이", icon="📈"),
         st.Page(disclosure_page, title="KRX 시장조치 조회", icon="📋"),
-        st.Page(nxt_changes_page, title="NXT 정규시장 종목 변동내역", icon="🔄"),
     ]
     navigation = st.navigation(pages)
     navigation.run()
