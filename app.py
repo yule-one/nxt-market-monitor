@@ -66,11 +66,12 @@ from src.nxt_change_store import (
 
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
-REST_UNIVERSE_RUNTIME_VERSION = 10
+REST_UNIVERSE_RUNTIME_VERSION = 11
 HISTORICAL_STORE_RUNTIME_VERSION = 12
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
-KIS_SHARED_CLIENT_RUNTIME_VERSION = 3
+KIS_SHARED_CLIENT_RUNTIME_VERSION = 4
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
+KIS_MINUTE_REQUEST_INTERVAL_SECONDS = 1.0
 NXT_LIMIT_PROXIMITY_TICKS = 3
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
@@ -437,6 +438,19 @@ def get_shared_kis_rest_client(
     return KisRestClient(
         KisCredentials(app_key=app_key, app_secret=app_secret),
         min_request_interval=KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS,
+    )
+
+
+@st.cache_resource
+def get_nxt_minute_kis_rest_client(
+    app_key: str,
+    app_secret: str,
+    runtime_version: int,
+) -> KisRestClient:
+    _ = runtime_version
+    return KisRestClient(
+        KisCredentials(app_key=app_key, app_secret=app_secret),
+        min_request_interval=KIS_MINUTE_REQUEST_INTERVAL_SECONDS,
     )
 
 
@@ -2375,7 +2389,7 @@ def _resolve_nxt_limit_hit_times(
         if now.strftime("%H%M%S") < "080000":
             return resolved, None
         end_time = min(now.strftime("%H%M%S"), "200000")
-    client = get_shared_kis_rest_client(
+    client = get_nxt_minute_kis_rest_client(
         app_key,
         app_secret,
         KIS_SHARED_CLIENT_RUNTIME_VERSION,
@@ -2469,7 +2483,7 @@ def _resolve_nxt_limit_proximity_times(
         if now.strftime("%H%M%S") < "080000":
             return resolved, None
         end_time = min(now.strftime("%H%M%S"), "200000")
-    client = get_shared_kis_rest_client(
+    client = get_nxt_minute_kis_rest_client(
         app_key,
         app_secret,
         KIS_SHARED_CLIENT_RUNTIME_VERSION,

@@ -8,6 +8,7 @@ import pytest
 from src.kis_rest import (
     IndexQuote,
     KisRestClient,
+    KisRestError,
     KisRestUniverseCollector,
     RestQuote,
     build_comparison_rows,
@@ -273,6 +274,28 @@ def test_nxt_limit_hit_times_use_adjusted_session_extreme_as_fallback() -> None:
     )
 
     assert hit_times == {"상한가": "084900"}
+
+
+def test_nxt_minute_requests_stop_during_morning_break(monkeypatch) -> None:
+    session = FakeSession()
+    client = KisRestClient(
+        KisCredentials("key", "secret"),
+        session=session,  # type: ignore[arg-type]
+        base_url="https://example.test",
+        min_request_interval=0,
+    )
+    monkeypatch.setattr("src.kis_rest.is_nxt_morning_break", lambda: True)
+
+    with pytest.raises(KisRestError):
+        client.fetch_nxt_minute_bars("005930", date(2026, 8, 6))
+    with pytest.raises(KisRestError):
+        client.fetch_nxt_limit_hit_times(
+            "005930",
+            date(2026, 8, 6),
+            {"upper": 71_600},
+        )
+
+    assert session.last_params == {}
 
 
 def test_access_token_cache_is_reused_across_clients(tmp_path: Path) -> None:
