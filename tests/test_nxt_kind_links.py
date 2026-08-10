@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime
 
 from src.models import Disclosure
 from src.nxt_eligibility import NxtUnavailabilityEvent
-from src.nxt_kind_links import match_unavailability_event
+from src.nxt_kind_links import match_unavailability_event, match_unavailability_events
 
 
 def _event(
@@ -136,20 +137,86 @@ def test_short_overheat_release_uses_three_trading_day_designation() -> None:
     assert "지정기간 종료" in matched.match_basis
 
 
-def test_default_lookback_matches_twenty_days_but_not_older() -> None:
+def test_default_lookback_matches_forty_five_days_but_not_older() -> None:
     within_window = _disclosure(
         "투자경고종목 지정",
-        disclosed_at=datetime(2026, 7, 15, 20, 0),
-        report_no="within-20-days",
+        disclosed_at=datetime(2026, 6, 20, 20, 0),
+        report_no="within-45-days",
     )
     outside_window = _disclosure(
         "투자경고종목 지정",
-        disclosed_at=datetime(2026, 7, 14, 20, 0),
-        report_no="outside-20-days",
+        disclosed_at=datetime(2026, 6, 19, 20, 0),
+        report_no="outside-45-days",
     )
 
     matched = match_unavailability_event(_event(), [within_window, outside_window])
 
     assert matched is not None
-    assert matched.report_no == "within-20-days"
+    assert matched.report_no == "within-45-days"
     assert match_unavailability_event(_event(), [outside_window]) is None
+
+
+def test_combined_suspension_notice_matches_start_event() -> None:
+    event = _event(reason="거래정지")
+    notice = _disclosure(
+        "매매거래정지및정지해제(주식분할)",
+        category="거래정지/재개",
+        disclosed_at=datetime(2026, 7, 28, 18, 0),
+    )
+
+    matched = match_unavailability_event(event, [notice])
+
+    assert matched is not None
+    assert matched.report_no == notice.report_no
+    assert "통합공시" in matched.match_basis
+
+
+def test_release_inherits_notice_only_from_same_open_period() -> None:
+    start = replace(
+        _event(reason="거래정지"),
+        event_date=date(2026, 7, 30),
+    )
+    release = replace(
+        _event(event_type="거래불가 해제", reason="시가기준가"),
+        event_date=date(2026, 8, 4),
+    )
+    notice = _disclosure(
+        "매매거래정지및정지해제(회사분할에 따른 전자등록 변경, 말소)",
+        category="거래정지/재개",
+        disclosed_at=datetime(2026, 7, 23, 18, 0),
+    )
+
+    matches = match_unavailability_events([start, release], [notice])
+
+    assert len(matches) == 2
+    assert matches[1].event_type == "거래불가 해제"
+    assert matches[1].report_no == notice.report_no
+    assert "원문 승계" in matches[1].match_basis
+
+
+def test_release_does_not_inherit_unrelated_reason_or_expired_period() -> None:
+    start = replace(
+        _event(reason="거래정지"),
+        event_date=date(2026, 6, 1),
+    )
+    unrelated_release = replace(
+        _event(event_type="거래불가 해제", reason="투자경고/위험"),
+        event_date=date(2026, 6, 10),
+    )
+    expired_release = replace(
+        _event(event_type="거래불가 해제", reason="시가기준가"),
+        event_date=date(2026, 8, 1),
+    )
+    notice = _disclosure(
+        "매매거래정지및정지해제(주식분할)",
+        category="거래정지/재개",
+        disclosed_at=datetime(2026, 5, 25, 18, 0),
+    )
+
+    unrelated = match_unavailability_events([start, unrelated_release], [notice])
+    expired = match_unavailability_events([start, expired_release], [notice])
+
+    assert len(unrelated) == 1
+    assert unrelated[0].event_type == "거래불가"
+    assert len(expired) == 1
+    assert expired[0].event_type == "거래불가"
