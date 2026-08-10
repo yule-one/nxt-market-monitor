@@ -48,6 +48,7 @@ from src.kis_websocket import KisCredentials, KisRealtimeCollector
 from src.market_realtime import NXT, MarketAggregator, MarketDataStore, WatchSymbol
 from src.models import NxtTradingStatus
 from src.nxt_client import NxtClient
+from src.nxt_api_control import NxtMinuteLookupGate, is_nxt_morning_break
 from src.nxt_price_limits import (
     first_limit_proximity_time,
     format_limit_hit_time,
@@ -64,9 +65,11 @@ from src.nxt_change_store import (
 
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
-REST_UNIVERSE_RUNTIME_VERSION = 7
+REST_UNIVERSE_RUNTIME_VERSION = 8
 HISTORICAL_STORE_RUNTIME_VERSION = 12
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
+KIS_SHARED_CLIENT_RUNTIME_VERSION = 1
+KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
 NXT_LIMIT_PROXIMITY_TICKS = 3
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
@@ -424,6 +427,30 @@ def get_realtime_runtime(
 
 
 @st.cache_resource
+def get_shared_kis_rest_client(
+    app_key: str,
+    app_secret: str,
+    runtime_version: int,
+) -> KisRestClient:
+    _ = runtime_version
+    return KisRestClient(
+        KisCredentials(app_key=app_key, app_secret=app_secret),
+        min_request_interval=KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS,
+    )
+
+
+@st.cache_resource
+def get_nxt_minute_lookup_gate(runtime_version: int) -> NxtMinuteLookupGate:
+    _ = runtime_version
+    return NxtMinuteLookupGate(
+        failure_base_seconds=60,
+        failure_max_seconds=300,
+        empty_retry_seconds=60,
+        success_cooldown_seconds=5,
+    )
+
+
+@st.cache_resource
 def get_rest_universe_runtime(
     app_key: str,
     app_secret: str,
@@ -431,7 +458,11 @@ def get_rest_universe_runtime(
 ) -> KisRestUniverseCollector:
     # 데이터 단위나 수집 로직이 바뀌면 캐시된 이전 수집기를 교체합니다.
     _ = runtime_version
-    client = KisRestClient(KisCredentials(app_key=app_key, app_secret=app_secret))
+    client = get_shared_kis_rest_client(
+        app_key,
+        app_secret,
+        KIS_SHARED_CLIENT_RUNTIME_VERSION,
+    )
     return KisRestUniverseCollector(client)
 
 
@@ -2238,6 +2269,12 @@ def _resolve_nxt_limit_hit_times(
         return resolved, None
 
     today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    now = pd.Timestamp.now(tz="Asia/Seoul")
+    if selected_date == today and is_nxt_morning_break(now.to_pydatetime()):
+        return (
+            resolved,
+            "NXT 08:50~09:00 휴장으로 시세·분봉 조회를 일시 중지합니다.",
+        )
     earliest_available = (pd.Timestamp(today) - pd.DateOffset(years=1)).date()
     if selected_date < earliest_available:
         return (
@@ -2251,13 +2288,21 @@ def _resolve_nxt_limit_hit_times(
 
     end_time = "200000"
     if selected_date == today:
-        now = pd.Timestamp.now(tz="Asia/Seoul")
         if now.strftime("%H%M%S") < "080000":
             return resolved, None
         end_time = min(now.strftime("%H%M%S"), "200000")
-    client = KisRestClient(KisCredentials(app_key, app_secret))
+    client = get_shared_kis_rest_client(
+        app_key,
+        app_secret,
+        KIS_SHARED_CLIENT_RUNTIME_VERSION,
+    )
+    lookup_gate = get_nxt_minute_lookup_gate(KIS_SHARED_CLIENT_RUNTIME_VERSION)
     errors: list[str] = []
     for symbol, targets in missing_by_symbol.items():
+        lookup_key = (selected_date.isoformat(), symbol)
+        permit = lookup_gate.claim(lookup_key)
+        if not permit.allowed:
+            continue
         try:
             found_times = client.fetch_nxt_limit_hit_times(
                 symbol,
@@ -2266,14 +2311,18 @@ def _resolve_nxt_limit_hit_times(
                 end_time=end_time,
             )
         except Exception as exc:
-            errors.append(f"{symbol}: {exc}")
+            retry_seconds = lookup_gate.fail(lookup_key, str(exc))
+            errors.append(
+                f"{symbol}: 분봉 서버 오류 · {retry_seconds}초 후 자동 재시도"
+            )
             continue
+        symbol_values: dict[tuple[str, str], str] = {}
         for direction, hit_time in found_times.items():
-            new_values[(symbol, direction)] = hit_time
-
-    if new_values:
-        store.save_nxt_limit_hit_times(selected_date, new_values)
-        resolved.update(new_values)
+            symbol_values[(symbol, direction)] = hit_time
+        if symbol_values:
+            store.save_nxt_limit_hit_times(selected_date, symbol_values)
+            resolved.update(symbol_values)
+        lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
     note = (
         f"일부 종목의 최초 기록시각을 확인하지 못했습니다: {errors[0]}"
         if errors
@@ -2321,6 +2370,12 @@ def _resolve_nxt_limit_proximity_times(
         return resolved, None
 
     today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    now = pd.Timestamp.now(tz="Asia/Seoul")
+    if selected_date == today and is_nxt_morning_break(now.to_pydatetime()):
+        return (
+            resolved,
+            "NXT 08:50~09:00 휴장으로 시세·분봉 조회를 일시 중지합니다.",
+        )
     earliest_available = (pd.Timestamp(today) - pd.DateOffset(years=1)).date()
     if selected_date < earliest_available:
         return (
@@ -2334,13 +2389,21 @@ def _resolve_nxt_limit_proximity_times(
 
     end_time = "200000"
     if selected_date == today:
-        now = pd.Timestamp.now(tz="Asia/Seoul")
         if now.strftime("%H%M%S") < "080000":
             return resolved, None
         end_time = min(now.strftime("%H%M%S"), "200000")
-    client = KisRestClient(KisCredentials(app_key, app_secret))
+    client = get_shared_kis_rest_client(
+        app_key,
+        app_secret,
+        KIS_SHARED_CLIENT_RUNTIME_VERSION,
+    )
+    lookup_gate = get_nxt_minute_lookup_gate(KIS_SHARED_CLIENT_RUNTIME_VERSION)
     errors: list[str] = []
     for symbol, targets in missing_by_symbol.items():
+        lookup_key = (selected_date.isoformat(), symbol)
+        permit = lookup_gate.claim(lookup_key)
+        if not permit.allowed:
+            continue
         try:
             bars = client.fetch_nxt_minute_bars(
                 symbol,
@@ -2348,7 +2411,10 @@ def _resolve_nxt_limit_proximity_times(
                 end_time=end_time,
             )
         except Exception as exc:
-            errors.append(f"{symbol}: {exc}")
+            retry_seconds = lookup_gate.fail(lookup_key, str(exc))
+            errors.append(
+                f"{symbol}: 분봉 서버 오류 · {retry_seconds}초 후 자동 재시도"
+            )
             continue
         minute_prices = [
             (
@@ -2360,6 +2426,7 @@ def _resolve_nxt_limit_proximity_times(
             )
             for bar in bars
         ]
+        symbol_values: dict[tuple[str, str], str] = {}
         for direction, limit_price, market in targets:
             hit_time = first_limit_proximity_time(
                 minute_prices,
@@ -2369,11 +2436,11 @@ def _resolve_nxt_limit_proximity_times(
                 market=market,
             )
             if hit_time is not None:
-                new_values[(symbol, direction)] = hit_time
-
-    if new_values:
-        store.save_nxt_limit_proximity_times(selected_date, new_values)
-        resolved.update(new_values)
+                symbol_values[(symbol, direction)] = hit_time
+        if symbol_values:
+            store.save_nxt_limit_proximity_times(selected_date, symbol_values)
+            resolved.update(symbol_values)
+        lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
     note = (
         f"일부 종목의 최초 기록시각을 확인하지 못했습니다: {errors[0]}"
         if errors

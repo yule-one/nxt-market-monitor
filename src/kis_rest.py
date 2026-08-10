@@ -17,6 +17,10 @@ from src.http import ResilientSession
 from src.kis_master import fetch_listed_shares as fetch_kis_listed_shares
 from src.kis_websocket import KisCredentials
 from src.market_realtime import KRX, NXT, WatchSymbol
+from src.nxt_api_control import (
+    is_nxt_morning_break,
+    seconds_until_nxt_morning_resume,
+)
 
 
 KIS_REST_BASE_URL = "https://openapi.koreainvestment.com:9443"
@@ -1121,6 +1125,15 @@ class KisRestUniverseCollector:
             self._state = state
             self._message = message
 
+    def _pause_for_nxt_morning_break(self) -> bool:
+        now = datetime.now(KST)
+        if not is_nxt_morning_break(now):
+            return False
+        self._set_status("휴장 대기", "NXT 08:50~09:00 휴장으로 REST 조회 중지")
+        wait_seconds = seconds_until_nxt_morning_resume(now)
+        self._stop_event.wait(min(max(wait_seconds, 1.0), 10.0))
+        return True
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             with self._lock:
@@ -1136,10 +1149,14 @@ class KisRestUniverseCollector:
                 self._set_status("대기", "조회할 NXT 종목이 없음")
                 self._stop_event.wait(1)
                 continue
+            if self._pause_for_nxt_morning_break():
+                continue
 
             cycle_started = time.monotonic()
             try:
                 self._set_status("갱신 중", "NXT 전종목 KRX/NXT 누적 시세 조회 중")
+                if self._pause_for_nxt_morning_break():
+                    continue
                 try:
                     listed_shares = self.client.fetch_listed_shares()
                     active_symbols = {item.symbol for item in symbols}
@@ -1152,6 +1169,8 @@ class KisRestUniverseCollector:
                 except Exception:
                     # 종목 마스터 갱신 실패 시 직전 상장주식수를 유지합니다.
                     pass
+                if self._pause_for_nxt_morning_break():
+                    continue
                 try:
                     index_quotes = self.client.fetch_index_quotes()
                     with self._lock:
@@ -1159,6 +1178,8 @@ class KisRestUniverseCollector:
                 except Exception:
                     # 지수 조회 실패가 전종목 누적 시세 갱신을 막지는 않게 합니다.
                     pass
+                if self._pause_for_nxt_morning_break():
+                    continue
                 try:
                     future_quotes = self.client.fetch_futures_quotes()
                     with self._lock:
@@ -1166,9 +1187,13 @@ class KisRestUniverseCollector:
                 except Exception:
                     # 선물 조회 실패가 전종목 누적 시세 갱신을 막지는 않게 합니다.
                     pass
+                paused_for_break = False
                 for start in range(0, len(symbols), self.symbols_per_request):
                     if self._stop_event.is_set():
                         return
+                    if self._pause_for_nxt_morning_break():
+                        paused_for_break = True
+                        break
                     with self._lock:
                         if revision != self._revision:
                             break
@@ -1187,6 +1212,8 @@ class KisRestUniverseCollector:
                         self._message = f"{len(symbols):,}종목 전체 갱신 완료"
                     remaining = max(0.0, interval - elapsed)
                     self._stop_event.wait(remaining)
+                    continue
+                if paused_for_break:
                     continue
             except Exception as exc:
                 self._set_status("오류", str(exc))
