@@ -67,6 +67,35 @@ class NxtEligibilityAdjustment:
     basis: str
 
 
+@dataclass(frozen=True)
+class NxtDailyUnavailability:
+    trade_date: date
+    stock_code: str
+    stock_name: str
+    market: str
+    tradable_market: str
+    unavailable_reason: str
+    source_type: str
+    source_title: str
+    source_url: str
+    basis: str
+
+
+@dataclass(frozen=True)
+class NxtUnavailabilityEvent:
+    event_date: date
+    stock_code: str
+    stock_name: str
+    market: str
+    event_type: str
+    tradable_market: str
+    unavailable_reason: str
+    source_type: str
+    source_title: str
+    source_url: str
+    basis: str
+
+
 def classify_nxt_change_type(change_type: str, reason: str) -> str:
     """원본 편입·편출을 종목선정 변경과 일시 거래제한으로 구분합니다."""
 

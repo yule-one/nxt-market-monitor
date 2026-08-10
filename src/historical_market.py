@@ -12,15 +12,19 @@ from pathlib import Path
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
+from src.config import NXT_CHANGE_PAGE_URL, NXT_TRADING_STATUS_PAGE_URL
 from src.krx_openapi import KrxDailySnapshot
 from src.kis_rest import FutureQuote, IndexQuote, NxtSessionQuote, RestQuote
 from src.market_realtime import KRX
 from src.models import NxtChange, NxtTradingStatus
 from src.nxt_eligibility import (
     NxtDailyEligibilitySummary,
+    NxtDailyUnavailability,
     NxtDailyReasonCount,
     NxtEligibilityAdjustment,
+    NxtUnavailabilityEvent,
     calculate_daily_eligibility,
+    classify_nxt_change_type,
     infer_missing_restriction_statuses,
 )
 from src.nxt_price_limits import (
@@ -426,6 +430,37 @@ class HistoricalMarketStore:
                     PRIMARY KEY (trade_date, stock_code)
                 );
 
+                CREATE TABLE IF NOT EXISTS nxt_daily_unavailability (
+                    trade_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    tradable_market TEXT NOT NULL,
+                    unavailable_reason TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_title TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (trade_date, stock_code)
+                );
+
+                CREATE TABLE IF NOT EXISTS nxt_unavailability_events (
+                    event_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    tradable_market TEXT NOT NULL,
+                    unavailable_reason TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_title TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (event_date, stock_code, event_type)
+                );
+
                 CREATE TABLE IF NOT EXISTS krx_daily_quotes (
                     trade_date TEXT NOT NULL,
                     stock_code TEXT NOT NULL,
@@ -572,6 +607,10 @@ class HistoricalMarketStore:
                     ON nxt_daily_eligibility_reason_counts(trade_date, reason_group);
                 CREATE INDEX IF NOT EXISTS idx_nxt_daily_eligibility_adjustment_date
                     ON nxt_daily_eligibility_adjustments(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_nxt_daily_unavailability_date
+                    ON nxt_daily_unavailability(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_nxt_unavailability_events_date
+                    ON nxt_unavailability_events(event_date, event_type);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_quotes_date
                     ON krx_daily_quotes(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_futures_date
@@ -1017,6 +1056,215 @@ class HistoricalMarketStore:
             ],
         )
 
+    @staticmethod
+    def _rebuild_nxt_unavailability_history(
+        connection: sqlite3.Connection,
+    ) -> dict[str, int]:
+        """거래현황을 우선으로 거래불가 일별 상태와 지정·해제 이력을 재구성합니다."""
+
+        updated_at = datetime.now(timezone.utc).isoformat()
+        connection.execute("DELETE FROM nxt_daily_unavailability")
+        connection.execute("DELETE FROM nxt_unavailability_events")
+
+        daily_rows: dict[tuple[str, str], tuple[object, ...]] = {}
+        quote_rows = connection.execute(
+            """
+            SELECT trade_date, stock_code, stock_name, market,
+                   tradable_market, unavailable_reason
+            FROM nxt_daily_quotes
+            ORDER BY trade_date, stock_code
+            """
+        ).fetchall()
+        statuses_by_date: dict[str, dict[str, sqlite3.Row]] = {}
+        for row in quote_rows:
+            date_key = str(row["trade_date"])
+            stock_code = str(row["stock_code"])
+            statuses_by_date.setdefault(date_key, {})[stock_code] = row
+            if str(row["tradable_market"]).strip() != "거래불가":
+                continue
+            unavailable_reason = str(row["unavailable_reason"]).strip()
+            if unavailable_reason in {"", "-"}:
+                unavailable_reason = "사유 미제공"
+            daily_rows[(date_key, stock_code)] = (
+                date_key,
+                stock_code,
+                str(row["stock_name"]),
+                str(row["market"]),
+                "거래불가",
+                unavailable_reason,
+                "OFFICIAL_STATUS",
+                "NXT 거래현황",
+                NXT_TRADING_STATUS_PAGE_URL,
+                "NXT 거래현황의 거래가능시장·거래불가사유",
+                updated_at,
+            )
+
+        adjustment_rows = connection.execute(
+            """
+            SELECT trade_date, stock_code, stock_name, market,
+                   unavailable_reason, basis
+            FROM nxt_daily_eligibility_adjustments
+            ORDER BY trade_date, stock_code
+            """
+        ).fetchall()
+        for row in adjustment_rows:
+            date_key = str(row["trade_date"])
+            stock_code = str(row["stock_code"])
+            key = (date_key, stock_code)
+            if key in daily_rows:
+                continue
+            unavailable_reason = str(row["unavailable_reason"]).strip()
+            if unavailable_reason in {"", "-"}:
+                unavailable_reason = "사유 미제공"
+            daily_rows[key] = (
+                date_key,
+                stock_code,
+                str(row["stock_name"]),
+                str(row["market"]),
+                "거래불가",
+                unavailable_reason,
+                "LEGACY_CHANGE",
+                "NXT 종목 변동내역",
+                NXT_CHANGE_PAGE_URL,
+                str(row["basis"]),
+                updated_at,
+            )
+
+        legacy_events: dict[tuple[str, str, str], sqlite3.Row] = {}
+        for row in connection.execute(
+            """
+            SELECT change_date, stock_code, change_type, reason
+            FROM nxt_membership_changes
+            ORDER BY change_date, registered_at, stock_code
+            """
+        ).fetchall():
+            event_type = classify_nxt_change_type(
+                str(row["change_type"]),
+                str(row["reason"]),
+            )
+            if event_type in {"거래불가", "거래불가 해제"}:
+                legacy_events[
+                    (
+                        str(row["change_date"]),
+                        str(row["stock_code"]),
+                        event_type,
+                    )
+                ] = row
+
+        connection.executemany(
+            """
+            INSERT INTO nxt_daily_unavailability (
+                trade_date, stock_code, stock_name, market, tradable_market,
+                unavailable_reason, source_type, source_title, source_url,
+                basis, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            list(daily_rows.values()),
+        )
+
+        unavailable_by_date: dict[str, dict[str, tuple[object, ...]]] = {}
+        for row in daily_rows.values():
+            unavailable_by_date.setdefault(str(row[0]), {})[str(row[1])] = row
+
+        event_rows: list[tuple[object, ...]] = []
+        previous_unavailable: dict[str, tuple[object, ...]] = {}
+        for date_key in sorted(statuses_by_date):
+            current_unavailable = unavailable_by_date.get(date_key, {})
+            current_statuses = statuses_by_date[date_key]
+            for stock_code in sorted(
+                current_unavailable.keys() - previous_unavailable.keys()
+            ):
+                row = current_unavailable[stock_code]
+                legacy_event = legacy_events.get((date_key, stock_code, "거래불가"))
+                if legacy_event is not None:
+                    source_type = "LEGACY_CHANGE"
+                    source_title = "NXT 종목 변동내역"
+                    source_url = NXT_CHANGE_PAGE_URL
+                    basis = f"NXT 변동내역: {legacy_event['reason']}"
+                else:
+                    source_type = str(row[6])
+                    source_title = str(row[7])
+                    source_url = str(row[8])
+                    basis = str(row[9])
+                event_rows.append(
+                    (
+                        date_key,
+                        stock_code,
+                        row[2],
+                        row[3],
+                        "거래불가",
+                        row[4],
+                        row[5],
+                        source_type,
+                        source_title,
+                        source_url,
+                        basis,
+                        updated_at,
+                    )
+                )
+            for stock_code in sorted(
+                previous_unavailable.keys() - current_unavailable.keys()
+            ):
+                current_status = current_statuses.get(stock_code)
+                if current_status is None:
+                    continue
+                tradable_market = str(current_status["tradable_market"]).strip()
+                if tradable_market == "거래불가":
+                    continue
+                previous_row = previous_unavailable[stock_code]
+                legacy_event = legacy_events.get(
+                    (date_key, stock_code, "거래불가 해제")
+                )
+                if legacy_event is not None:
+                    source_type = "LEGACY_CHANGE"
+                    source_title = "NXT 종목 변동내역"
+                    source_url = NXT_CHANGE_PAGE_URL
+                    basis = f"NXT 변동내역: {legacy_event['reason']}"
+                else:
+                    source_type = "OFFICIAL_STATUS"
+                    source_title = "NXT 거래현황"
+                    source_url = NXT_TRADING_STATUS_PAGE_URL
+                    basis = (
+                        "전 거래일 거래불가 → 당일 거래가능시장 "
+                        f"{tradable_market or '전체'}"
+                    )
+                event_rows.append(
+                    (
+                        date_key,
+                        stock_code,
+                        str(current_status["stock_name"]),
+                        str(current_status["market"]),
+                        "거래불가 해제",
+                        tradable_market or "전체",
+                        previous_row[5],
+                        source_type,
+                        source_title,
+                        source_url,
+                        basis,
+                        updated_at,
+                    )
+                )
+            previous_unavailable = current_unavailable
+
+        connection.executemany(
+            """
+            INSERT INTO nxt_unavailability_events (
+                event_date, stock_code, stock_name, market, event_type,
+                tradable_market, unavailable_reason, source_type,
+                source_title, source_url, basis, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            event_rows,
+        )
+        return {
+            "daily_rows": len(daily_rows),
+            "event_rows": len(event_rows),
+        }
+
+    def rebuild_nxt_unavailability_history(self) -> dict[str, int]:
+        with self._lock, self._connect() as connection:
+            return self._rebuild_nxt_unavailability_history(connection)
+
     def rebuild_nxt_eligibility_history(
         self,
         start_date: date,
@@ -1154,6 +1402,7 @@ class HistoricalMarketStore:
                     trading_date,
                     statuses,
                 )
+            self._rebuild_nxt_unavailability_history(connection)
         return len(trading_dates)
 
     def save_historical_snapshot(
@@ -1251,6 +1500,7 @@ class HistoricalMarketStore:
                 trading_date,
                 status_rows,
             )
+            self._rebuild_nxt_unavailability_history(connection)
             krx_rows: list[tuple[object, ...]] = []
             for symbol in symbols:
                 quote = krx_snapshot.stock_quotes.get((symbol, KRX))
@@ -1374,6 +1624,7 @@ class HistoricalMarketStore:
                 trading_date,
                 status_rows,
             )
+            self._rebuild_nxt_unavailability_history(connection)
         return len(status_rows)
 
     def save_nxt_session_quotes(
@@ -2328,6 +2579,110 @@ class HistoricalMarketStore:
             )
             for row in rows
         ]
+
+    def list_nxt_daily_unavailability(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> list[NxtDailyUnavailability]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT trade_date, stock_code, stock_name, market,
+                       tradable_market, unavailable_reason, source_type,
+                       source_title, source_url, basis
+                FROM nxt_daily_unavailability
+                WHERE trade_date BETWEEN ? AND ?
+                ORDER BY trade_date, stock_code
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        return [
+            NxtDailyUnavailability(
+                trade_date=date.fromisoformat(str(row["trade_date"])),
+                stock_code=str(row["stock_code"]),
+                stock_name=str(row["stock_name"]),
+                market=str(row["market"]),
+                tradable_market=str(row["tradable_market"]),
+                unavailable_reason=str(row["unavailable_reason"]),
+                source_type=str(row["source_type"]),
+                source_title=str(row["source_title"]),
+                source_url=str(row["source_url"]),
+                basis=str(row["basis"]),
+            )
+            for row in rows
+        ]
+
+    def list_nxt_unavailability_events(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> list[NxtUnavailabilityEvent]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT event_date, stock_code, stock_name, market, event_type,
+                       tradable_market, unavailable_reason, source_type,
+                       source_title, source_url, basis
+                FROM nxt_unavailability_events
+                WHERE event_date BETWEEN ? AND ?
+                ORDER BY event_date, stock_code, event_type
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        return [
+            NxtUnavailabilityEvent(
+                event_date=date.fromisoformat(str(row["event_date"])),
+                stock_code=str(row["stock_code"]),
+                stock_name=str(row["stock_name"]),
+                market=str(row["market"]),
+                event_type=str(row["event_type"]),
+                tradable_market=str(row["tradable_market"]),
+                unavailable_reason=str(row["unavailable_reason"]),
+                source_type=str(row["source_type"]),
+                source_title=str(row["source_title"]),
+                source_url=str(row["source_url"]),
+                basis=str(row["basis"]),
+            )
+            for row in rows
+        ]
+
+    def nxt_unavailability_history_coverage(self) -> dict[str, object]:
+        with self._lock, self._connect() as connection:
+            daily = connection.execute(
+                """
+                SELECT COUNT(*) AS row_count,
+                       COUNT(DISTINCT trade_date) AS trading_days,
+                       MIN(trade_date) AS first_date,
+                       MAX(trade_date) AS last_date
+                FROM nxt_daily_unavailability
+                """
+            ).fetchone()
+            events = connection.execute(
+                """
+                SELECT COUNT(*) AS event_count,
+                       SUM(event_type = '거래불가') AS restriction_starts,
+                       SUM(event_type = '거래불가 해제') AS restriction_ends
+                FROM nxt_unavailability_events
+                """
+            ).fetchone()
+        return {
+            "row_count": int(daily["row_count"] or 0),
+            "trading_days": int(daily["trading_days"] or 0),
+            "first_date": (
+                date.fromisoformat(str(daily["first_date"]))
+                if daily["first_date"]
+                else None
+            ),
+            "last_date": (
+                date.fromisoformat(str(daily["last_date"]))
+                if daily["last_date"]
+                else None
+            ),
+            "event_count": int(events["event_count"] or 0),
+            "restriction_starts": int(events["restriction_starts"] or 0),
+            "restriction_ends": int(events["restriction_ends"] or 0),
+        }
 
     def nxt_eligibility_history_coverage(self) -> dict[str, object]:
         with self._lock, self._connect() as connection:

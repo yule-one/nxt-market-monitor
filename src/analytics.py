@@ -16,7 +16,7 @@ from src.models import (
     StatusPeriod,
 )
 from src.nxt_change_context import contextual_change_reason, source_context_for_change
-from src.nxt_eligibility import classify_nxt_change
+from src.nxt_eligibility import NxtUnavailabilityEvent, classify_nxt_change
 
 
 def normalize_name(value: str) -> str:
@@ -316,6 +316,28 @@ def nxt_changes_to_frame(changes: Sequence[NxtChange]) -> pd.DataFrame:
                 "원본사유": item.reason,
             }
             for item in changes
+        ]
+    )
+
+
+def nxt_unavailability_events_to_frame(
+    events: Sequence[NxtUnavailabilityEvent],
+) -> pd.DataFrame:
+    return pd.DataFrame.from_records(
+        [
+            {
+                "일자": item.event_date,
+                "종목코드": item.stock_code,
+                "종목명": item.stock_name,
+                "상장시장": item.market,
+                "구분": item.event_type,
+                "거래가능시장": item.tradable_market,
+                "거래불가사유": item.unavailable_reason,
+                "데이터근거": item.source_title,
+                "판단근거": item.basis,
+                "원문": item.source_url,
+            }
+            for item in events
         ]
     )
 
