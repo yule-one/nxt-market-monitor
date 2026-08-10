@@ -217,6 +217,28 @@ def test_unavailability_frame_prefers_matched_kind_original() -> None:
     assert frame.iloc[0]["원문"] == "https://kind.example/viewer"
 
 
+def test_unavailability_frame_leaves_unmatched_original_blank() -> None:
+    event = NxtUnavailabilityEvent(
+        event_date=date(2026, 8, 4),
+        stock_code="437730",
+        stock_name="삼현",
+        market="KOSDAQ",
+        event_type="거래불가",
+        tradable_market="거래불가",
+        unavailable_reason="거래정지",
+        source_type="OFFICIAL_STATUS",
+        source_title="NXT 거래현황",
+        source_url="https://nextrade.example/status",
+        basis="일별 상태 비교",
+    )
+
+    frame = nxt_unavailability_events_to_frame([event])
+
+    assert frame.iloc[0]["원문구분"] == ""
+    assert frame.iloc[0]["KIND 공시"] == ""
+    assert frame.iloc[0]["원문"] == ""
+
+
 def test_preferred_share_notice_is_not_joined_to_common_share() -> None:
     item = disclosure(
         date(2025, 3, 5),
