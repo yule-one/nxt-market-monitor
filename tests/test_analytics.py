@@ -10,6 +10,7 @@ from src.analytics import (
     extract_state_transitions,
     is_preferred_share_notice,
     match_disclosures_to_nxt_status,
+    nxt_changes_display_frame,
     nxt_changes_to_frame,
     nxt_trading_status_to_frame,
     nxt_unavailability_events_to_frame,
@@ -154,6 +155,27 @@ def test_nxt_change_frame_uses_user_facing_column_names() -> None:
     assert frame.iloc[0]["원본사유"] == "시장관리"
     assert frame.iloc[0]["보정여부"] == "원본"
     assert not {"시장", "변동", "사유"}.intersection(frame.columns)
+
+
+def test_nxt_change_display_frame_hides_audit_columns() -> None:
+    frame = nxt_changes_display_frame(
+        [nxt_change(date(2025, 3, 5), "123450", "편출", "시장관리")]
+    )
+
+    assert frame.columns.tolist() == [
+        "일자",
+        "종목코드",
+        "종목명",
+        "상장시장",
+        "변동내역",
+        "변경사유",
+    ]
+    assert not {
+        "데이터근거",
+        "보정여부",
+        "원본변동내역",
+        "원본사유",
+    }.intersection(frame.columns)
 
 
 def test_nxt_change_frame_accepts_cached_legacy_objects() -> None:

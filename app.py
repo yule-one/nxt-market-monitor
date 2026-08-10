@@ -18,6 +18,7 @@ from src.analytics import (
     classify_nxt_change,
     disclosures_to_frame,
     match_disclosures_to_nxt_status,
+    nxt_changes_display_frame,
     nxt_changes_to_frame,
     nxt_unavailability_events_to_frame,
     nxt_trading_status_to_frame,
@@ -3604,7 +3605,7 @@ def nxt_changes_page() -> None:
         )
 
     with detail_tab:
-        change_frame = nxt_changes_to_frame(membership_changes)
+        change_frame = nxt_changes_display_frame(membership_changes)
         if change_frame.empty:
             st.info("선택한 기간의 NXT 편입·편출 내역이 없습니다.")
         else:

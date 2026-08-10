@@ -320,6 +320,24 @@ def nxt_changes_to_frame(changes: Sequence[NxtChange]) -> pd.DataFrame:
     )
 
 
+def nxt_changes_display_frame(changes: Sequence[NxtChange]) -> pd.DataFrame:
+    """종목별 변동내역 탭에 필요한 사용자 표시 칼럼만 반환합니다."""
+
+    frame = nxt_changes_to_frame(changes)
+    if frame.empty:
+        return frame
+    return frame[
+        [
+            "일자",
+            "종목코드",
+            "종목명",
+            "상장시장",
+            "변동내역",
+            "변경사유",
+        ]
+    ]
+
+
 def nxt_unavailability_events_to_frame(
     events: Sequence[NxtUnavailabilityEvent],
 ) -> pd.DataFrame:
