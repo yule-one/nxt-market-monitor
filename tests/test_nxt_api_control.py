@@ -37,6 +37,17 @@ def test_minute_lookup_gate_deduplicates_five_sessions() -> None:
     assert all(item.reason == "다른 접속자가 조회 중" for item in permits[1:])
 
 
+def test_minute_lookup_gate_reclaims_abandoned_lookup() -> None:
+    gate = NxtMinuteLookupGate(in_flight_timeout_seconds=30)
+    key = ("2026-08-10", "488900")
+
+    assert gate.claim(key, now=100.0).allowed
+    assert not gate.claim(key, now=129.9).allowed
+    reclaimed = gate.claim(key, now=130.0)
+    assert reclaimed.allowed
+    assert reclaimed.reason == "만료된 조회 잠금 회수"
+
+
 def test_minute_lookup_gate_backs_off_failures() -> None:
     gate = NxtMinuteLookupGate(
         failure_base_seconds=60,

@@ -68,6 +68,7 @@ class NxtMinuteLookupGate:
         failure_max_seconds: float = 300.0,
         empty_retry_seconds: float = 60.0,
         success_cooldown_seconds: float = 5.0,
+        in_flight_timeout_seconds: float = 30.0,
         state_ttl_seconds: float = 3_600.0,
     ) -> None:
         self.failure_base_seconds = max(1.0, float(failure_base_seconds))
@@ -79,6 +80,10 @@ class NxtMinuteLookupGate:
         self.success_cooldown_seconds = max(
             1.0,
             float(success_cooldown_seconds),
+        )
+        self.in_flight_timeout_seconds = max(
+            5.0,
+            float(in_flight_timeout_seconds),
         )
         self.state_ttl_seconds = max(60.0, float(state_ttl_seconds))
         self._lock = threading.RLock()
@@ -104,7 +109,13 @@ class NxtMinuteLookupGate:
                 )
                 return MinuteLookupPermit(True)
             if state.in_flight:
-                return MinuteLookupPermit(False, reason="다른 접속자가 조회 중")
+                if timestamp - state.updated_at < self.in_flight_timeout_seconds:
+                    return MinuteLookupPermit(False, reason="다른 접속자가 조회 중")
+                # Streamlit 세션 이동·재실행으로 조회가 중단되면 완료 콜백이
+                # 실행되지 않을 수 있으므로 오래된 잠금은 새 세션이 회수합니다.
+                state.in_flight = True
+                state.updated_at = timestamp
+                return MinuteLookupPermit(True, reason="만료된 조회 잠금 회수")
             if timestamp < state.next_retry_at:
                 return MinuteLookupPermit(
                     False,
