@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from collections import Counter
@@ -62,6 +63,9 @@ from src.nxt_change_store import (
     NxtChangeStore,
     NxtChangeSyncService,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 SHOW_CHARTS = False
@@ -2281,7 +2285,19 @@ def _fetch_and_store_nxt_limit_hit_times(
         }
         if symbol_values:
             store.save_nxt_limit_hit_times(selected_date, symbol_values)
+        else:
+            LOGGER.warning(
+                "NXT limit-hit minute lookup returned no match: date=%s symbol=%s",
+                selected_date.isoformat(),
+                symbol,
+            )
     except Exception as exc:
+        LOGGER.warning(
+            "NXT limit-hit minute lookup failed: date=%s symbol=%s error=%s",
+            selected_date.isoformat(),
+            symbol,
+            exc,
+        )
         lookup_gate.fail(lookup_key, str(exc))
         return
     lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
@@ -2326,7 +2342,19 @@ def _fetch_and_store_nxt_limit_proximity_times(
                 symbol_values[(symbol, direction)] = hit_time
         if symbol_values:
             store.save_nxt_limit_proximity_times(selected_date, symbol_values)
+        else:
+            LOGGER.warning(
+                "NXT proximity minute lookup returned no match: date=%s symbol=%s",
+                selected_date.isoformat(),
+                symbol,
+            )
     except Exception as exc:
+        LOGGER.warning(
+            "NXT proximity minute lookup failed: date=%s symbol=%s error=%s",
+            selected_date.isoformat(),
+            symbol,
+            exc,
+        )
         lookup_gate.fail(lookup_key, str(exc))
         return
     lookup_gate.complete(lookup_key, has_result=bool(symbol_values))
