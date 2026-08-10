@@ -453,6 +453,20 @@ def build_daily_nxt_metrics_from_counts(
     return pd.DataFrame.from_records(records)
 
 
+def summarize_nxt_membership_flow(metrics: pd.DataFrame) -> tuple[int, int, int]:
+    """조회기간의 일별 편입·편출 건수와 순증감을 반환합니다."""
+
+    if metrics.empty:
+        return 0, 0, 0
+    additions = int(
+        pd.to_numeric(metrics["당일 편입 종목수"], errors="coerce").fillna(0).sum()
+    )
+    exclusions = int(
+        pd.to_numeric(metrics["당일 편출 종목수"], errors="coerce").fillna(0).sum()
+    )
+    return additions, exclusions, additions - exclusions
+
+
 def build_daily_metrics(
     matched_disclosures: Sequence[dict],
     statuses_by_date: Mapping[date, Sequence[NxtTradingStatus]],
