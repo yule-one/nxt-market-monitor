@@ -21,7 +21,11 @@ from src.kis_websocket import KisCredentials
 from src.krx_openapi import KrxOpenApiClient
 from src.nxt_client import NxtClient
 from src.nxt_change_store import NxtChangeStore
-from src.nxt_kind_links import KIND_LINK_CATEGORIES, match_unavailability_events
+from src.nxt_kind_links import (
+    KIND_LINK_CATEGORIES,
+    KIND_LINK_LOOKBACK_DAYS,
+    match_unavailability_events,
+)
 from src.nxt_price_limits import reached_limit_points
 
 
@@ -139,7 +143,10 @@ def _sync_nxt_unavailability_kind_links(
         return
     events = store.list_nxt_unavailability_events(start_date, end_date)
     disclosures = KindClient(ResponseCache()).fetch_disclosures(
-        max(NXT_LAUNCH_DATE, start_date - timedelta(days=10)),
+        max(
+            NXT_LAUNCH_DATE - timedelta(days=KIND_LINK_LOOKBACK_DAYS),
+            start_date - timedelta(days=KIND_LINK_LOOKBACK_DAYS),
+        ),
         end_date,
         categories=KIND_LINK_CATEGORIES,
         force_refresh=True,
@@ -205,7 +212,10 @@ def main() -> int:
         try:
             _sync_nxt_unavailability_kind_links(
                 store,
-                max(NXT_LAUNCH_DATE, target_date - timedelta(days=10)),
+                max(
+                    NXT_LAUNCH_DATE,
+                    target_date - timedelta(days=KIND_LINK_LOOKBACK_DAYS),
+                ),
                 target_date,
                 logger,
             )
