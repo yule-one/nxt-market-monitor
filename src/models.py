@@ -15,6 +15,11 @@ class NxtChange:
     reason: str
     isin: str = ""
     registered_at: int = 0
+    display_reason: str = ""
+    source_title: str = ""
+    source_url: str = ""
+    basis: str = ""
+    is_inferred: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         result = asdict(self)

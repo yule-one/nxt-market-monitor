@@ -15,6 +15,7 @@ from src.models import (
     NxtTradingStatus,
     StatusPeriod,
 )
+from src.nxt_change_context import contextual_change_reason, source_context_for_change
 from src.nxt_eligibility import classify_nxt_change
 
 
@@ -308,12 +309,35 @@ def nxt_changes_to_frame(changes: Sequence[NxtChange]) -> pd.DataFrame:
                 "종목명": item.stock_name,
                 "상장시장": item.market,
                 "변동내역": classify_nxt_change(item),
+                "변경사유": contextual_change_reason(item),
+                "데이터근거": source_context_for_change(item).source_title,
+                "보정여부": "보정" if item.is_inferred else "원본",
                 "원본변동내역": item.change_type,
-                "변동사유": item.reason,
+                "원본사유": item.reason,
             }
             for item in changes
         ]
     )
+
+
+def summarize_daily_nxt_change_reasons(changes: Sequence[NxtChange]) -> str:
+    grouped: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for item in changes:
+        grouped[(classify_nxt_change(item), contextual_change_reason(item))].add(
+            item.stock_code
+        )
+    group_order = {"편입": 0, "편출": 1, "거래불가": 2, "거래불가 해제": 3}
+    parts = [
+        f"{group}—{reason}: {len(codes):,}종목"
+        for (group, reason), codes in sorted(
+            grouped.items(),
+            key=lambda item: (
+                group_order.get(item[0][0], 99),
+                item[0][1],
+            ),
+        )
+    ]
+    return " · ".join(parts) if parts else "-"
 
 
 def build_daily_nxt_metrics(
@@ -357,6 +381,7 @@ def build_daily_nxt_metrics(
                         if classify_nxt_change(item) == "편출"
                     }
                 ),
+                "변경사유": summarize_daily_nxt_change_reasons(daily_changes),
             }
         )
     return pd.DataFrame.from_records(records)
@@ -400,6 +425,7 @@ def build_daily_nxt_metrics_from_counts(
                         if classify_nxt_change(item) == "편출"
                     }
                 ),
+                "변경사유": summarize_daily_nxt_change_reasons(daily_changes),
             }
         )
     return pd.DataFrame.from_records(records)

@@ -11,7 +11,14 @@ from zoneinfo import ZoneInfo
 from src.cache import ResponseCache
 from src.config import NXT_LAUNCH_DATE
 from src.models import NxtChange
+from src.nxt_change_context import (
+    ChangeContext,
+    NXT_CHANGE_LIST_URL,
+    inferred_addition_context,
+    inferred_exclusion_context,
+)
 from src.nxt_client import NxtClient
+from src.nxt_eligibility import classify_nxt_change
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -80,6 +87,22 @@ class NxtChangeStore:
                     event_count INTEGER NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS nxt_membership_change_adjustments (
+                    change_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    change_type TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    display_reason TEXT NOT NULL,
+                    isin TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    source_title TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (change_date, stock_code, change_type)
+                );
+
                 CREATE TABLE IF NOT EXISTS nxt_change_sync_state (
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     last_attempt_at TEXT,
@@ -99,6 +122,8 @@ class NxtChangeStore:
                     ON nxt_membership_changes(change_date);
                 CREATE INDEX IF NOT EXISTS idx_nxt_membership_changes_stock
                     ON nxt_membership_changes(stock_code, change_date);
+                CREATE INDEX IF NOT EXISTS idx_nxt_membership_adjustments_date
+                    ON nxt_membership_change_adjustments(change_date);
                 """
             )
 
@@ -106,7 +131,7 @@ class NxtChangeStore:
         if end_date < start_date:
             return []
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
+            raw_rows = connection.execute(
                 """
                 SELECT change_date, stock_code, stock_name, market,
                        change_type, reason, isin, registered_at
@@ -116,7 +141,18 @@ class NxtChangeStore:
                 """,
                 (start_date.isoformat(), end_date.isoformat()),
             ).fetchall()
-        return [
+            adjustment_rows = connection.execute(
+                """
+                SELECT change_date, stock_code, stock_name, market,
+                       change_type, reason, display_reason, isin, basis,
+                       source_title, source_url
+                FROM nxt_membership_change_adjustments
+                WHERE change_date BETWEEN ? AND ?
+                ORDER BY change_date, stock_code
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        raw_changes = [
             NxtChange(
                 change_date=date.fromisoformat(str(row["change_date"])),
                 stock_code=str(row["stock_code"]),
@@ -127,8 +163,242 @@ class NxtChangeStore:
                 isin=str(row["isin"]),
                 registered_at=int(row["registered_at"]),
             )
-            for row in rows
+            for row in raw_rows
         ]
+        raw_keys = {
+            (item.change_date, item.stock_code, classify_nxt_change(item))
+            for item in raw_changes
+        }
+        inferred_changes = [
+            NxtChange(
+                change_date=date.fromisoformat(str(row["change_date"])),
+                stock_code=str(row["stock_code"]),
+                stock_name=str(row["stock_name"]),
+                market=str(row["market"]),
+                change_type=str(row["change_type"]),
+                reason=str(row["reason"]),
+                isin=str(row["isin"]),
+                registered_at=0,
+                display_reason=str(row["display_reason"]),
+                source_title=str(row["source_title"]),
+                source_url=str(row["source_url"]),
+                basis=str(row["basis"]),
+                is_inferred=True,
+            )
+            for row in adjustment_rows
+        ]
+        combined = raw_changes + [
+            item
+            for item in inferred_changes
+            if (item.change_date, item.stock_code, classify_nxt_change(item))
+            not in raw_keys
+        ]
+        return sorted(
+            combined,
+            key=lambda item: (
+                item.change_date,
+                item.registered_at,
+                item.stock_code,
+                item.change_type,
+            ),
+        )
+
+    def rebuild_inferred_changes(self) -> int:
+        """일별 대상 명단과 원본 변동내역을 대사해 누락 변동을 보완합니다."""
+
+        with self._lock, self._connect() as connection:
+            quote_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nxt_daily_quotes'"
+            ).fetchone()
+            if quote_table is None:
+                connection.execute("DELETE FROM nxt_membership_change_adjustments")
+                return 0
+            date_rows = connection.execute(
+                "SELECT DISTINCT trade_date FROM nxt_daily_quotes ORDER BY trade_date"
+            ).fetchall()
+            trading_dates = [
+                date.fromisoformat(str(row["trade_date"])) for row in date_rows
+            ]
+            if not trading_dates:
+                connection.execute("DELETE FROM nxt_membership_change_adjustments")
+                return 0
+
+            codes_by_date: dict[date, set[str]] = {}
+            metadata: dict[str, tuple[str, str, str]] = {}
+            for trading_date in trading_dates:
+                rows = connection.execute(
+                    """
+                    SELECT stock_code, stock_name, market, isin
+                    FROM nxt_daily_quotes WHERE trade_date = ?
+                    """,
+                    (trading_date.isoformat(),),
+                ).fetchall()
+                codes_by_date[trading_date] = {str(row["stock_code"]) for row in rows}
+                for row in rows:
+                    metadata[str(row["stock_code"])] = (
+                        str(row["stock_name"]),
+                        str(row["market"]),
+                        str(row["isin"]),
+                    )
+
+            eligibility_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='nxt_daily_eligibility_adjustments'"
+            ).fetchone()
+            if eligibility_table is not None:
+                for row in connection.execute(
+                    """
+                    SELECT trade_date, stock_code, stock_name, market
+                    FROM nxt_daily_eligibility_adjustments
+                    """
+                ):
+                    trading_date = date.fromisoformat(str(row["trade_date"]))
+                    if trading_date not in codes_by_date:
+                        continue
+                    code = str(row["stock_code"])
+                    codes_by_date[trading_date].add(code)
+                    old = metadata.get(code, ("", "", ""))
+                    metadata[code] = (
+                        str(row["stock_name"]) or old[0],
+                        str(row["market"]) or old[1],
+                        old[2],
+                    )
+
+            raw_rows = connection.execute(
+                """
+                SELECT change_date, stock_code, stock_name, market,
+                       change_type, reason, isin, registered_at
+                FROM nxt_membership_changes
+                ORDER BY change_date, registered_at, stock_code
+                """
+            ).fetchall()
+            raw_changes = [
+                NxtChange(
+                    change_date=date.fromisoformat(str(row["change_date"])),
+                    stock_code=str(row["stock_code"]),
+                    stock_name=str(row["stock_name"]),
+                    market=str(row["market"]),
+                    change_type=str(row["change_type"]),
+                    reason=str(row["reason"]),
+                    isin=str(row["isin"]),
+                    registered_at=int(row["registered_at"]),
+                )
+                for row in raw_rows
+            ]
+            raw_membership: dict[tuple[date, str], set[str]] = {}
+            for item in raw_changes:
+                group = classify_nxt_change(item)
+                if group in {"편입", "편출"}:
+                    raw_membership.setdefault((item.change_date, group), set()).add(
+                        item.stock_code
+                    )
+
+            last_present_index: dict[str, int] = {}
+            for index, trading_date in enumerate(trading_dates):
+                for code in codes_by_date[trading_date]:
+                    last_present_index[code] = index
+
+            inferred: list[tuple[object, ...]] = []
+            seen_codes: set[str] = set()
+            previous_codes: set[str] = set()
+            updated_at = datetime.now(timezone.utc).isoformat()
+
+            def add_row(
+                trading_date: date,
+                stock_code: str,
+                change_type: str,
+                reason: str,
+                context: ChangeContext,
+                basis: str,
+            ) -> None:
+                stock_name, market, isin = metadata.get(stock_code, ("", "", ""))
+                inferred.append(
+                    (
+                        trading_date.isoformat(),
+                        stock_code,
+                        stock_name,
+                        market,
+                        change_type,
+                        reason,
+                        context.display_reason,
+                        isin,
+                        basis,
+                        context.source_title,
+                        context.source_url,
+                        updated_at,
+                    )
+                )
+
+            for index, trading_date in enumerate(trading_dates):
+                current_codes = codes_by_date[trading_date]
+                additions = current_codes - previous_codes
+                exclusions = previous_codes - current_codes
+                raw_additions = raw_membership.get((trading_date, "편입"), set())
+                raw_exclusions = raw_membership.get((trading_date, "편출"), set())
+
+                for code in sorted(additions - raw_additions):
+                    known = inferred_addition_context(trading_date, code)
+                    if known is not None:
+                        reason, context = known
+                        add_row(
+                            trading_date,
+                            code,
+                            "편입",
+                            reason,
+                            context,
+                            "전일·당일 NXT 대상 명단 차이와 공식 선정 공지",
+                        )
+                    elif code not in seen_codes:
+                        add_row(
+                            trading_date,
+                            code,
+                            "편입",
+                            "변동내역 누락(대상 명단 편입)",
+                            ChangeContext(
+                                "대상 명단 편입(사유 확인 필요)",
+                                "NXT 일별 대상 명단 대사",
+                                NXT_CHANGE_LIST_URL,
+                            ),
+                            "전일·당일 NXT 대상 명단 차이",
+                        )
+
+                for code in sorted(exclusions - raw_exclusions):
+                    known = inferred_exclusion_context(trading_date, code)
+                    if known is not None:
+                        reason, context, basis = known
+                        add_row(trading_date, code, "편출", reason, context, basis)
+                        continue
+                    has_future_row = last_present_index.get(code, -1) > index
+                    enough_confirmation = len(trading_dates) - index > 5
+                    if not has_future_row and enough_confirmation:
+                        add_row(
+                            trading_date,
+                            code,
+                            "편출",
+                            "변동내역 누락(대상 명단 제외)",
+                            ChangeContext(
+                                "대상 명단 제외(사유 확인 필요)",
+                                "NXT 일별 대상 명단 대사",
+                                NXT_CHANGE_LIST_URL,
+                            ),
+                            "전일·당일 NXT 대상 명단 차이; 원본 변동내역 없음",
+                        )
+
+                seen_codes.update(current_codes)
+                previous_codes = current_codes
+
+            connection.execute("DELETE FROM nxt_membership_change_adjustments")
+            connection.executemany(
+                """
+                INSERT INTO nxt_membership_change_adjustments (
+                    change_date, stock_code, stock_name, market, change_type,
+                    reason, display_reason, isin, basis, source_title,
+                    source_url, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                inferred,
+            )
+        return len(inferred)
 
     def missing_ranges(
         self,
@@ -233,9 +503,20 @@ class NxtChangeStore:
         # 지역 import로 저장소 모듈 간 초기화 순환을 피합니다.
         from src.historical_market import HistoricalMarketStore
 
-        HistoricalMarketStore(self.path).rebuild_nxt_eligibility_history(
-            start_date,
-            end_date,
+        self.rebuild_inferred_changes()
+        historical_store = HistoricalMarketStore(self.path)
+        with self._lock, self._connect() as connection:
+            coverage_row = connection.execute(
+                "SELECT MAX(trade_date) AS last_date FROM nxt_daily_quotes"
+            ).fetchone()
+        coverage_end = (
+            date.fromisoformat(str(coverage_row["last_date"]))
+            if coverage_row and coverage_row["last_date"]
+            else end_date
+        )
+        historical_store.rebuild_nxt_eligibility_history(
+            NXT_LAUNCH_DATE,
+            coverage_end,
         )
 
     def try_claim(self, start_date: date, end_date: date) -> bool:
@@ -305,7 +586,11 @@ class NxtChangeStore:
             ).fetchone()
             event_count = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM nxt_membership_changes"
+                    """
+                    SELECT
+                        (SELECT COUNT(*) FROM nxt_membership_changes) +
+                        (SELECT COUNT(*) FROM nxt_membership_change_adjustments)
+                    """
                 ).fetchone()[0]
             )
             state = connection.execute(

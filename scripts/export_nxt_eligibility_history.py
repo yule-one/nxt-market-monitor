@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.config import NXT_LAUNCH_DATE
 from src.historical_market import HistoricalMarketStore
 from src.nxt_change_store import NxtChangeStore
+from src.nxt_change_context import contextual_change_reason, source_context_for_change
 from src.nxt_eligibility import classify_nxt_change
 
 
@@ -97,6 +98,7 @@ def _wide_summary(summary: pd.DataFrame, reasons: pd.DataFrame) -> pd.DataFrame:
 def _classified_change_frame(start: date, end: date) -> pd.DataFrame:
     rows = []
     for item in NxtChangeStore().list_changes(start, end):
+        source_context = source_context_for_change(item)
         rows.append(
             {
                 "일자": item.change_date,
@@ -106,6 +108,11 @@ def _classified_change_frame(start: date, end: date) -> pd.DataFrame:
                 "원본변동구분": item.change_type,
                 "원본사유": item.reason,
                 "재분류구분": classify_nxt_change(item),
+                "변경사유": contextual_change_reason(item),
+                "데이터근거": source_context.source_title,
+                "근거URL": source_context.source_url,
+                "보정여부": "보정" if item.is_inferred else "원본",
+                "보정근거": item.basis,
             }
         )
     frame = pd.DataFrame(rows)
@@ -299,6 +306,22 @@ def _validate_frames(
                 f"NXT 공식 확대 공지 대사 실패: {milestone:%Y-%m-%d} "
                 f"기대 {expected}, 실제 {actual}"
             )
+    flow_expectations = {
+        pd.Timestamp("2025-03-24"): (240, 0),
+        pd.Timestamp("2025-03-31"): (446, 0),
+        pd.Timestamp("2025-07-31"): (0, 1),
+        pd.Timestamp("2026-01-02"): (223, 152),
+    }
+    for milestone, expected in flow_expectations.items():
+        if milestone not in summary_by_date.index:
+            continue
+        row = summary_by_date.loc[milestone]
+        actual = (int(row["편입종목수"]), int(row["편출종목수"]))
+        if actual != expected:
+            raise RuntimeError(
+                f"공식 선정 명단·일별 대상 명단 대사 실패: {milestone:%Y-%m-%d} "
+                f"기대 {expected}, 실제 {actual}"
+            )
 
 
 def _format_workbook(writer: pd.ExcelWriter) -> None:
@@ -355,6 +378,7 @@ def main() -> None:
         parser.error("종료일은 시작일보다 빠를 수 없습니다.")
 
     store = HistoricalMarketStore()
+    inferred_count = NxtChangeStore().rebuild_inferred_changes()
     rebuilt_days = store.rebuild_nxt_eligibility_history(
         args.start_date,
         args.end_date,
@@ -391,7 +415,7 @@ def main() -> None:
                 sheet_name=sheet_name,
                 index=False,
             )
-        changes.to_excel(writer, sheet_name="변동원문_재분류", index=False)
+        changes.to_excel(writer, sheet_name="변동내역_보정포함", index=False)
         adjustments.to_excel(writer, sheet_name="과거거래불가보정", index=False)
         _classification_rules().to_excel(writer, sheet_name="분류기준", index=False)
         _format_workbook(writer)
@@ -404,6 +428,7 @@ def main() -> None:
         f"거래불가 지정 {coverage['restrictions']:,}건 · "
         f"거래불가 해제 {coverage['restriction_releases']:,}건"
     )
+    print(f"원본 누락 변동 보정: {inferred_count:,}건")
     print(f"Excel: {output_path} ({output_path.stat().st_size:,} bytes)")
 
 

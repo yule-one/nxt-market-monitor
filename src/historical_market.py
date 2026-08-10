@@ -372,6 +372,22 @@ class HistoricalMarketStore:
                     PRIMARY KEY (change_date, stock_code, change_type, reason)
                 );
 
+                CREATE TABLE IF NOT EXISTS nxt_membership_change_adjustments (
+                    change_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    market TEXT NOT NULL,
+                    change_type TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    display_reason TEXT NOT NULL,
+                    isin TEXT NOT NULL,
+                    basis TEXT NOT NULL,
+                    source_title TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (change_date, stock_code, change_type)
+                );
+
                 CREATE TABLE IF NOT EXISTS nxt_daily_eligibility_summary (
                     trade_date TEXT PRIMARY KEY,
                     target_stock_count INTEGER NOT NULL,
@@ -902,12 +918,18 @@ class HistoricalMarketStore:
         change_rows = connection.execute(
             """
             SELECT change_date, stock_code, stock_name, market, change_type,
-                   reason, isin, registered_at
-            FROM nxt_membership_changes
-            WHERE change_date = ?
+                   reason, isin, registered_at, '' AS display_reason,
+                   '' AS basis, '' AS source_title, '' AS source_url,
+                   0 AS is_inferred
+            FROM nxt_membership_changes WHERE change_date = ?
+            UNION ALL
+            SELECT change_date, stock_code, stock_name, market, change_type,
+                   reason, isin, 0 AS registered_at, display_reason,
+                   basis, source_title, source_url, 1 AS is_inferred
+            FROM nxt_membership_change_adjustments WHERE change_date = ?
             ORDER BY registered_at, stock_code
             """,
-            (date_key,),
+            (date_key, date_key),
         ).fetchall()
         changes = [
             NxtChange(
@@ -919,6 +941,11 @@ class HistoricalMarketStore:
                 reason=str(row["reason"]),
                 isin=str(row["isin"]),
                 registered_at=int(row["registered_at"]),
+                display_reason=str(row["display_reason"]),
+                basis=str(row["basis"]),
+                source_title=str(row["source_title"]),
+                source_url=str(row["source_url"]),
+                is_inferred=bool(row["is_inferred"]),
             )
             for row in change_rows
         ]
@@ -1029,12 +1056,18 @@ class HistoricalMarketStore:
             change_rows = connection.execute(
                 """
                 SELECT change_date, stock_code, stock_name, market, change_type,
-                       reason, isin, registered_at
-                FROM nxt_membership_changes
-                WHERE change_date <= ?
+                       reason, isin, registered_at, '' AS display_reason,
+                       '' AS basis, '' AS source_title, '' AS source_url,
+                       0 AS is_inferred
+                FROM nxt_membership_changes WHERE change_date <= ?
+                UNION ALL
+                SELECT change_date, stock_code, stock_name, market, change_type,
+                       reason, isin, 0 AS registered_at, display_reason,
+                       basis, source_title, source_url, 1 AS is_inferred
+                FROM nxt_membership_change_adjustments WHERE change_date <= ?
                 ORDER BY change_date, registered_at, stock_code
                 """,
-                (end_date.isoformat(),),
+                (end_date.isoformat(), end_date.isoformat()),
             ).fetchall()
             changes = [
                 NxtChange(
@@ -1046,6 +1079,11 @@ class HistoricalMarketStore:
                     reason=str(row["reason"]),
                     isin=str(row["isin"]),
                     registered_at=int(row["registered_at"]),
+                    display_reason=str(row["display_reason"]),
+                    basis=str(row["basis"]),
+                    source_title=str(row["source_title"]),
+                    source_url=str(row["source_url"]),
+                    is_inferred=bool(row["is_inferred"]),
                 )
                 for row in change_rows
             ]
