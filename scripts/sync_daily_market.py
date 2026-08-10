@@ -15,11 +15,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.cache import ResponseCache
 from src.config import NXT_LAUNCH_DATE
 from src.historical_market import HistoricalMarketStore
+from src.kind_client import KindClient
 from src.kis_rest import KisRestClient
 from src.kis_websocket import KisCredentials
 from src.krx_openapi import KrxOpenApiClient
 from src.nxt_client import NxtClient
 from src.nxt_change_store import NxtChangeStore
+from src.nxt_kind_links import KIND_LINK_CATEGORIES, match_unavailability_events
 from src.nxt_price_limits import reached_limit_points
 
 
@@ -127,6 +129,37 @@ def _sync_nxt_limit_hit_times(
     )
 
 
+def _sync_nxt_unavailability_kind_links(
+    store: HistoricalMarketStore,
+    start_date: date,
+    end_date: date,
+    logger: logging.Logger,
+) -> None:
+    if end_date < start_date:
+        return
+    events = store.list_nxt_unavailability_events(start_date, end_date)
+    disclosures = KindClient(ResponseCache()).fetch_disclosures(
+        max(NXT_LAUNCH_DATE, start_date - timedelta(days=10)),
+        end_date,
+        categories=KIND_LINK_CATEGORIES,
+        force_refresh=True,
+        max_workers=3,
+    )
+    links = match_unavailability_events(events, disclosures)
+    stored = store.replace_nxt_unavailability_kind_links(
+        start_date,
+        end_date,
+        links,
+    )
+    logger.info(
+        "NXT 거래불가 KIND 원문 연결 완료: 범위=%s~%s 이벤트=%s 연결=%s",
+        start_date,
+        end_date,
+        len(events),
+        stored,
+    )
+
+
 def _target_date(now: datetime) -> date:
     """Return the previous Korean calendar day for the 08:00 daily job."""
     local_now = now.astimezone(KST)
@@ -169,6 +202,15 @@ def main() -> int:
         )
         inferred_count = NxtChangeStore(store.path).rebuild_inferred_changes()
         store.rebuild_nxt_eligibility_history(NXT_LAUNCH_DATE, target_date)
+        try:
+            _sync_nxt_unavailability_kind_links(
+                store,
+                max(NXT_LAUNCH_DATE, target_date - timedelta(days=10)),
+                target_date,
+                logger,
+            )
+        except Exception:
+            logger.exception("NXT 거래불가 KIND 원문 연결 실패: 목표=%s", target_date)
         logger.info("원본 누락 종목 변동 보정=%s건", inferred_count)
         return 0
 
@@ -212,6 +254,19 @@ def main() -> int:
         store.rebuild_derived_metrics()
         inferred_count = NxtChangeStore(store.path).rebuild_inferred_changes()
         store.rebuild_nxt_eligibility_history(NXT_LAUNCH_DATE, target_date)
+        try:
+            _sync_nxt_unavailability_kind_links(
+                store,
+                start_date,
+                target_date,
+                logger,
+            )
+        except Exception:
+            logger.exception(
+                "NXT 거래불가 KIND 원문 연결 실패: 범위=%s~%s",
+                start_date,
+                target_date,
+            )
         logger.info(
             "당일 확정 데이터 동기화 완료: 범위=%s~%s 거래일=%s 변동보정=%s",
             start_date,

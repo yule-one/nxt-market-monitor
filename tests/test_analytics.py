@@ -12,9 +12,11 @@ from src.analytics import (
     match_disclosures_to_nxt_status,
     nxt_changes_to_frame,
     nxt_trading_status_to_frame,
+    nxt_unavailability_events_to_frame,
     summarize_nxt_membership_flow,
 )
 from src.models import Disclosure, NxtChange, NxtTradingStatus, StatusPeriod
+from src.nxt_eligibility import NxtUnavailabilityEvent
 
 
 def nxt_change(
@@ -189,6 +191,30 @@ def test_nxt_change_reclassifies_temporary_trading_restrictions() -> None:
     assert classify_nxt_change(released) == "거래불가 해제"
     frame = nxt_changes_to_frame([warning, released])
     assert frame["변동내역"].tolist() == ["거래불가", "거래불가 해제"]
+
+
+def test_unavailability_frame_prefers_matched_kind_original() -> None:
+    event = NxtUnavailabilityEvent(
+        event_date=date(2026, 8, 4),
+        stock_code="437730",
+        stock_name="삼현",
+        market="KOSDAQ",
+        event_type="거래불가",
+        tradable_market="거래불가",
+        unavailable_reason="투자경고/위험",
+        source_type="OFFICIAL_STATUS",
+        source_title="NXT 거래현황",
+        source_url="https://nextrade.example/status",
+        basis="일별 상태 비교",
+        kind_title="투자경고종목지정",
+        kind_viewer_url="https://kind.example/viewer",
+    )
+
+    frame = nxt_unavailability_events_to_frame([event])
+
+    assert frame.iloc[0]["원문구분"] == "KIND"
+    assert frame.iloc[0]["KIND 공시"] == "투자경고종목지정"
+    assert frame.iloc[0]["원문"] == "https://kind.example/viewer"
 
 
 def test_preferred_share_notice_is_not_joined_to_common_share() -> None:

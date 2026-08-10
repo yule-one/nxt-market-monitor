@@ -20,6 +20,7 @@ from src.krx_openapi import KrxDailySnapshot
 from src.market_realtime import KRX
 from src.models import NxtChange, NxtTradingStatus
 from src.nxt_change_store import NxtChangeStore
+from src.nxt_eligibility import NxtUnavailabilityKindLink
 
 
 KST = ZoneInfo("Asia/Seoul")
@@ -299,6 +300,51 @@ def test_unavailability_events_preserve_legacy_change_source(tmp_path: Path) -> 
     assert [item.event_type for item in events] == ["거래불가", "거래불가 해제"]
     assert {item.source_type for item in events} == {"LEGACY_CHANGE"}
     assert {item.source_title for item in events} == {"NXT 종목 변동내역"}
+
+
+def test_unavailability_event_joins_kind_original_link(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    trading_date = date(2026, 8, 4)
+    store = HistoricalMarketStore(database_path)
+    store.save_nxt_statuses(
+        trading_date,
+        [
+            NxtTradingStatus(
+                status_date=trading_date,
+                stock_code="437730",
+                stock_name="삼현",
+                market="KOSDAQ",
+                tradable_market="거래불가",
+                unavailable_reason="투자경고/위험",
+            )
+        ],
+    )
+    link = NxtUnavailabilityKindLink(
+        event_date=trading_date,
+        stock_code="437730",
+        event_type="거래불가",
+        report_no="20260803000883",
+        category="투자경고종목",
+        title="투자경고종목 지정",
+        disclosed_at=datetime(2026, 8, 3, 20, 0),
+        viewer_url="https://kind.example/20260803000883",
+        match_basis="종목코드·사유·방향 일치",
+    )
+
+    assert store.replace_nxt_unavailability_kind_links(
+        trading_date,
+        trading_date,
+        [link],
+    ) == 1
+    event = store.list_nxt_unavailability_events(
+        trading_date,
+        trading_date,
+    )[0]
+
+    assert event.kind_report_no == "20260803000883"
+    assert event.kind_title == "투자경고종목 지정"
+    assert event.kind_viewer_url == "https://kind.example/20260803000883"
+    assert store.nxt_unavailability_history_coverage()["kind_link_count"] == 1
 
 
 def test_historical_store_round_trip_and_metrics(tmp_path: Path) -> None:

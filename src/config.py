@@ -14,6 +14,7 @@ CATEGORY_CODES: OrderedDict[str, tuple[str, ...]] = OrderedDict(
         "거래정지/재개": ("0311",),
         "관리종목": ("0350",),
         "투자주의환기종목": ("0356",),
+        "투자주의종목": ("0341",),
         "투자경고종목": ("0342",),
         "투자위험종목": ("0343",),
         "단기과열종목": ("0358",),
@@ -25,7 +26,7 @@ CATEGORY_CODES: OrderedDict[str, tuple[str, ...]] = OrderedDict(
 STATE_CATEGORIES = tuple(
     category
     for category in CATEGORY_CODES
-    if category not in {"기타시장안내", "상장폐지"}
+    if category not in {"투자주의종목", "기타시장안내", "상장폐지"}
 )
 
 MARKET_LABELS = {
