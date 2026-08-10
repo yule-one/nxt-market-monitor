@@ -66,6 +66,7 @@ SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 7
 HISTORICAL_STORE_RUNTIME_VERSION = 12
+NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 NXT_LIMIT_PROXIMITY_TICKS = 3
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
@@ -380,17 +381,27 @@ def get_historical_market_store() -> HistoricalMarketStore:
 
 
 @st.cache_resource
-def get_nxt_change_store() -> NxtChangeStore:
+def _get_nxt_change_store(runtime_version: int) -> NxtChangeStore:
+    _ = runtime_version
     return NxtChangeStore()
 
 
+def get_nxt_change_store() -> NxtChangeStore:
+    return _get_nxt_change_store(NXT_CHANGE_STORE_RUNTIME_VERSION)
+
+
 @st.cache_resource
-def get_nxt_change_scheduler() -> NxtChangeScheduler:
+def _get_nxt_change_scheduler(runtime_version: int) -> NxtChangeScheduler:
+    _ = runtime_version
     service = NxtChangeSyncService(
         get_nxt_change_store(),
         client_factory=lambda: NxtClient(get_response_cache()),
     )
     return NxtChangeScheduler(service)
+
+
+def get_nxt_change_scheduler() -> NxtChangeScheduler:
+    return _get_nxt_change_scheduler(NXT_CHANGE_STORE_RUNTIME_VERSION)
 
 
 @st.cache_resource
