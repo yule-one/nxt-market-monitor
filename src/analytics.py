@@ -335,7 +335,9 @@ def nxt_unavailability_events_to_frame(
                 "거래불가사유": item.unavailable_reason,
                 "데이터근거": item.source_title,
                 "판단근거": item.basis,
-                "원문": item.source_url,
+                "원문구분": "KIND" if item.kind_viewer_url else "NXT",
+                "KIND 공시": item.kind_title or "-",
+                "원문": item.kind_viewer_url or item.source_url,
             }
             for item in events
         ]

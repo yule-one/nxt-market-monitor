@@ -23,6 +23,7 @@ from src.nxt_eligibility import (
     NxtDailyReasonCount,
     NxtEligibilityAdjustment,
     NxtUnavailabilityEvent,
+    NxtUnavailabilityKindLink,
     calculate_daily_eligibility,
     classify_nxt_change_type,
     infer_missing_restriction_statuses,
@@ -461,6 +462,20 @@ class HistoricalMarketStore:
                     PRIMARY KEY (event_date, stock_code, event_type)
                 );
 
+                CREATE TABLE IF NOT EXISTS nxt_unavailability_kind_links (
+                    event_date TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    report_no TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    disclosed_at TEXT NOT NULL,
+                    viewer_url TEXT NOT NULL,
+                    match_basis TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (event_date, stock_code, event_type)
+                );
+
                 CREATE TABLE IF NOT EXISTS krx_daily_quotes (
                     trade_date TEXT NOT NULL,
                     stock_code TEXT NOT NULL,
@@ -611,6 +626,8 @@ class HistoricalMarketStore:
                     ON nxt_daily_unavailability(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_nxt_unavailability_events_date
                     ON nxt_unavailability_events(event_date, event_type);
+                CREATE INDEX IF NOT EXISTS idx_nxt_unavailability_kind_links_report
+                    ON nxt_unavailability_kind_links(report_no);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_quotes_date
                     ON krx_daily_quotes(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_futures_date
@@ -1255,6 +1272,18 @@ class HistoricalMarketStore:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             event_rows,
+        )
+        connection.execute(
+            """
+            DELETE FROM nxt_unavailability_kind_links
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM nxt_unavailability_events AS event
+                WHERE event.event_date = nxt_unavailability_kind_links.event_date
+                  AND event.stock_code = nxt_unavailability_kind_links.stock_code
+                  AND event.event_type = nxt_unavailability_kind_links.event_type
+            )
+            """
         )
         return {
             "daily_rows": len(daily_rows),
@@ -2621,12 +2650,23 @@ class HistoricalMarketStore:
         with self._lock, self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT event_date, stock_code, stock_name, market, event_type,
-                       tradable_market, unavailable_reason, source_type,
-                       source_title, source_url, basis
-                FROM nxt_unavailability_events
-                WHERE event_date BETWEEN ? AND ?
-                ORDER BY event_date, stock_code, event_type
+                SELECT event.event_date, event.stock_code, event.stock_name,
+                       event.market, event.event_type, event.tradable_market,
+                       event.unavailable_reason, event.source_type,
+                       event.source_title, event.source_url, event.basis,
+                       kind.report_no AS kind_report_no,
+                       kind.category AS kind_category,
+                       kind.title AS kind_title,
+                       kind.disclosed_at AS kind_disclosed_at,
+                       kind.viewer_url AS kind_viewer_url,
+                       kind.match_basis AS kind_match_basis
+                FROM nxt_unavailability_events AS event
+                LEFT JOIN nxt_unavailability_kind_links AS kind
+                  ON kind.event_date = event.event_date
+                 AND kind.stock_code = event.stock_code
+                 AND kind.event_type = event.event_type
+                WHERE event.event_date BETWEEN ? AND ?
+                ORDER BY event.event_date, event.stock_code, event.event_type
                 """,
                 (start_date.isoformat(), end_date.isoformat()),
             ).fetchall()
@@ -2643,9 +2683,64 @@ class HistoricalMarketStore:
                 source_title=str(row["source_title"]),
                 source_url=str(row["source_url"]),
                 basis=str(row["basis"]),
+                kind_report_no=str(row["kind_report_no"] or ""),
+                kind_category=str(row["kind_category"] or ""),
+                kind_title=str(row["kind_title"] or ""),
+                kind_disclosed_at=(
+                    datetime.fromisoformat(str(row["kind_disclosed_at"]))
+                    if row["kind_disclosed_at"]
+                    else None
+                ),
+                kind_viewer_url=str(row["kind_viewer_url"] or ""),
+                kind_match_basis=str(row["kind_match_basis"] or ""),
             )
             for row in rows
         ]
+
+    def replace_nxt_unavailability_kind_links(
+        self,
+        start_date: date,
+        end_date: date,
+        links: Iterable[NxtUnavailabilityKindLink],
+    ) -> int:
+        if end_date < start_date:
+            return 0
+        selected = [
+            item for item in links if start_date <= item.event_date <= end_date
+        ]
+        updated_at = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM nxt_unavailability_kind_links
+                WHERE event_date BETWEEN ? AND ?
+                """,
+                (start_date.isoformat(), end_date.isoformat()),
+            )
+            connection.executemany(
+                """
+                INSERT INTO nxt_unavailability_kind_links (
+                    event_date, stock_code, event_type, report_no, category,
+                    title, disclosed_at, viewer_url, match_basis, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        item.event_date.isoformat(),
+                        item.stock_code,
+                        item.event_type,
+                        item.report_no,
+                        item.category,
+                        item.title,
+                        item.disclosed_at.isoformat(),
+                        item.viewer_url,
+                        item.match_basis,
+                        updated_at,
+                    )
+                    for item in selected
+                ],
+            )
+        return len(selected)
 
     def nxt_unavailability_history_coverage(self) -> dict[str, object]:
         with self._lock, self._connect() as connection:
@@ -2666,6 +2761,9 @@ class HistoricalMarketStore:
                 FROM nxt_unavailability_events
                 """
             ).fetchone()
+            kind_links = connection.execute(
+                "SELECT COUNT(*) AS link_count FROM nxt_unavailability_kind_links"
+            ).fetchone()
         return {
             "row_count": int(daily["row_count"] or 0),
             "trading_days": int(daily["trading_days"] or 0),
@@ -2682,6 +2780,7 @@ class HistoricalMarketStore:
             "event_count": int(events["event_count"] or 0),
             "restriction_starts": int(events["restriction_starts"] or 0),
             "restriction_ends": int(events["restriction_ends"] or 0),
+            "kind_link_count": int(kind_links["link_count"] or 0),
         }
 
     def nxt_eligibility_history_coverage(self) -> dict[str, object]:

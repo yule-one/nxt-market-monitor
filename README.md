@@ -91,13 +91,14 @@ KRX 전체 종목 원본을 날짜마다 중복 보관하지 않고, 대시보�
 
 변동 원본은 `history.db`의 `nxt_membership_changes` 테이블에 그대로 저장합니다. 일별 대상 명단에는 반영됐지만 변동 원본에 없는 내역은 `nxt_membership_change_adjustments`에 근거·출처와 함께 별도 저장합니다. 데이터가 없는 날도 동기화 완료일로 기록하는 `nxt_change_sync_days`와 실행 상태를 기록하는 `nxt_change_sync_state`를 함께 사용해, 앱 재시작 후에도 누락 날짜만 보충합니다.
 
-거래불가 일별 상태는 `nxt_daily_unavailability`, 거래불가 지정·해제 이벤트는 `nxt_unavailability_events`에 별도로 저장합니다. 거래현황 원본을 우선 사용하고, 거래현황에서 사유 제공이 시작되기 전 구간은 종목 변동내역으로 복원합니다.
+거래불가 일별 상태는 `nxt_daily_unavailability`, 거래불가 지정·해제 이벤트는 `nxt_unavailability_events`에 별도로 저장합니다. 거래현황 원본을 우선 사용하고, 거래현황에서 사유 제공이 시작되기 전 구간은 종목 변동내역으로 복원합니다. KIND 공시 연결은 `nxt_unavailability_kind_links`에 별도로 저장하며, 종목코드·거래불가 사유·지정/해제 방향·공시일이 일치하는 경우에만 KIND 원문을 사용합니다. 매칭되지 않은 이벤트는 기존 NXT 원문을 유지합니다.
 
 최초 전체 적재 또는 수동 재적재는 다음 명령으로 실행합니다.
 
 ```powershell
 python scripts\sync_nxt_changes.py --start 2025-03-04 --end 2026-08-05 --force
 python scripts\rebuild_nxt_unavailability.py
+python scripts\backfill_nxt_unavailability_kind_links.py --start 2025-03-04 --end 2026-08-10
 python scripts\build_history_seed.py
 ```
 

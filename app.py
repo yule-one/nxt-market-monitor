@@ -73,7 +73,7 @@ LOGGER = logging.getLogger(__name__)
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 11
-HISTORICAL_STORE_RUNTIME_VERSION = 13
+HISTORICAL_STORE_RUNTIME_VERSION = 14
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 4
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
@@ -3701,6 +3701,10 @@ def nxt_changes_page() -> None:
             (
                 "거래불가 현황은 NXT 거래현황을 우선 사용하고, 사유 제공 전 구간은 "
                 "종목 변동내역으로 보완합니다."
+            ),
+            (
+                "거래불가 현황의 KIND 원문은 종목코드·사유·지정/해제 방향과 날짜가 "
+                "일치할 때만 연결합니다. 확실한 KIND 공시가 없으면 NXT 원문을 표시합니다."
             ),
             (
                 "공식 변동내역 없이 명단에서 사라지거나 추가된 종목은 일별 대상 명단과 "

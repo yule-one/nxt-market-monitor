@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Iterable
 
 from src.config import (
@@ -94,6 +94,25 @@ class NxtUnavailabilityEvent:
     source_title: str
     source_url: str
     basis: str
+    kind_report_no: str = ""
+    kind_category: str = ""
+    kind_title: str = ""
+    kind_disclosed_at: datetime | None = None
+    kind_viewer_url: str = ""
+    kind_match_basis: str = ""
+
+
+@dataclass(frozen=True)
+class NxtUnavailabilityKindLink:
+    event_date: date
+    stock_code: str
+    event_type: str
+    report_no: str
+    category: str
+    title: str
+    disclosed_at: datetime
+    viewer_url: str
+    match_basis: str
 
 
 def classify_nxt_change_type(change_type: str, reason: str) -> str:
