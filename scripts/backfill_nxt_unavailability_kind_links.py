@@ -15,7 +15,11 @@ from src.cache import ResponseCache
 from src.config import NXT_LAUNCH_DATE
 from src.historical_market import HistoricalMarketStore
 from src.kind_client import KindClient
-from src.nxt_kind_links import KIND_LINK_CATEGORIES, match_unavailability_events
+from src.nxt_kind_links import (
+    KIND_LINK_CATEGORIES,
+    KIND_LINK_LOOKBACK_DAYS,
+    match_unavailability_events,
+)
 
 
 def main() -> None:
@@ -30,20 +34,32 @@ def main() -> None:
     parser.add_argument("--start", type=date.fromisoformat, default=NXT_LAUNCH_DATE)
     parser.add_argument("--end", type=date.fromisoformat, default=date.today())
     parser.add_argument("--force-refresh", action="store_true")
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=KIND_LINK_LOOKBACK_DAYS,
+        help="NXT 이벤트일 이전 KIND 공시 조회 일수",
+    )
     args = parser.parse_args()
     if args.end < args.start:
         parser.error("종료일은 시작일보다 빠를 수 없습니다.")
+    if args.lookback_days < 1:
+        parser.error("조회 일수는 1일 이상이어야 합니다.")
 
     store = HistoricalMarketStore(args.database.resolve())
     events = store.list_nxt_unavailability_events(args.start, args.end)
     disclosures = KindClient(ResponseCache()).fetch_disclosures(
-        max(date(2000, 1, 1), args.start - timedelta(days=10)),
+        max(date(2000, 1, 1), args.start - timedelta(days=args.lookback_days)),
         args.end,
         categories=KIND_LINK_CATEGORIES,
         force_refresh=args.force_refresh,
         max_workers=3,
     )
-    links = match_unavailability_events(events, disclosures)
+    links = match_unavailability_events(
+        events,
+        disclosures,
+        lookback_days=args.lookback_days,
+    )
     stored = store.replace_nxt_unavailability_kind_links(
         args.start,
         args.end,

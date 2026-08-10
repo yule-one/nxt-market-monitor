@@ -134,3 +134,22 @@ def test_short_overheat_release_uses_three_trading_day_designation() -> None:
 
     assert matched is not None
     assert "지정기간 종료" in matched.match_basis
+
+
+def test_default_lookback_matches_twenty_days_but_not_older() -> None:
+    within_window = _disclosure(
+        "투자경고종목 지정",
+        disclosed_at=datetime(2026, 7, 15, 20, 0),
+        report_no="within-20-days",
+    )
+    outside_window = _disclosure(
+        "투자경고종목 지정",
+        disclosed_at=datetime(2026, 7, 14, 20, 0),
+        report_no="outside-20-days",
+    )
+
+    matched = match_unavailability_event(_event(), [within_window, outside_window])
+
+    assert matched is not None
+    assert matched.report_no == "within-20-days"
+    assert match_unavailability_event(_event(), [outside_window]) is None

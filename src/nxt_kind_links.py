@@ -20,6 +20,7 @@ KIND_LINK_CATEGORIES = (
     "단기과열종목",
     "기타시장안내",
 )
+KIND_LINK_LOOKBACK_DAYS = 20
 
 _REASON_CATEGORIES = {
     "투자경고/위험": {
@@ -130,7 +131,7 @@ def match_unavailability_event(
     event: NxtUnavailabilityEvent,
     disclosures: Sequence[Disclosure],
     *,
-    lookback_days: int = 10,
+    lookback_days: int = KIND_LINK_LOOKBACK_DAYS,
 ) -> NxtUnavailabilityKindLink | None:
     """NXT 거래불가 이벤트에 방향과 날짜가 일치하는 KIND 공시를 연결합니다."""
 
@@ -198,7 +199,7 @@ def match_unavailability_events(
     events: Iterable[NxtUnavailabilityEvent],
     disclosures: Sequence[Disclosure],
     *,
-    lookback_days: int = 10,
+    lookback_days: int = KIND_LINK_LOOKBACK_DAYS,
 ) -> list[NxtUnavailabilityKindLink]:
     by_stock: dict[str, list[Disclosure]] = defaultdict(list)
     for disclosure in disclosures:
