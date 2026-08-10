@@ -16,7 +16,11 @@ from src.models import (
     StatusPeriod,
 )
 from src.nxt_change_context import contextual_change_reason, source_context_for_change
-from src.nxt_eligibility import NxtUnavailabilityEvent, classify_nxt_change
+from src.nxt_eligibility import (
+    NxtDailyReasonCount,
+    NxtUnavailabilityEvent,
+    classify_nxt_change,
+)
 
 
 def normalize_name(value: str) -> str:
@@ -378,6 +382,24 @@ def summarize_daily_nxt_change_reasons(changes: Sequence[NxtChange]) -> str:
                 item[0][1],
             ),
         )
+    ]
+    return " · ".join(parts) if parts else "-"
+
+
+def summarize_daily_nxt_unavailability_reasons(
+    reason_counts: Sequence[NxtDailyReasonCount],
+) -> str:
+    """일별 거래불가 사유별 종목수를 한 셀에 표시할 문자열로 만듭니다."""
+
+    grouped: dict[str, int] = defaultdict(int)
+    for item in reason_counts:
+        if item.reason_group != "거래불가사유" or item.stock_count <= 0:
+            continue
+        reason = item.reason.strip() or "사유 미제공"
+        grouped[reason] += item.stock_count
+    parts = [
+        f"{reason}: {stock_count:,}종목"
+        for reason, stock_count in sorted(grouped.items())
     ]
     return " · ".join(parts) if parts else "-"
 

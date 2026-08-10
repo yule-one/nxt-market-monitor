@@ -14,10 +14,11 @@ from src.analytics import (
     nxt_changes_to_frame,
     nxt_trading_status_to_frame,
     nxt_unavailability_events_to_frame,
+    summarize_daily_nxt_unavailability_reasons,
     summarize_nxt_membership_flow,
 )
 from src.models import Disclosure, NxtChange, NxtTradingStatus, StatusPeriod
-from src.nxt_eligibility import NxtUnavailabilityEvent
+from src.nxt_eligibility import NxtDailyReasonCount, NxtUnavailabilityEvent
 
 
 def nxt_change(
@@ -438,6 +439,20 @@ def test_daily_nxt_metrics_excludes_restrictions_from_membership_changes() -> No
     )
     assert metrics["당일 편출 종목수"].sum() == 0
     assert metrics["당일 편입 종목수"].sum() == 0
+
+
+def test_summarize_daily_nxt_unavailability_reasons() -> None:
+    trading_date = date(2026, 8, 10)
+    reason_counts = [
+        NxtDailyReasonCount(trading_date, "거래불가사유", "거래정지", 3),
+        NxtDailyReasonCount(trading_date, "거래불가사유", "투자경고/위험", 2),
+        NxtDailyReasonCount(trading_date, "편출", "정기변경", 10),
+    ]
+
+    label = summarize_daily_nxt_unavailability_reasons(reason_counts)
+
+    assert label == "거래정지: 3종목 · 투자경고/위험: 2종목"
+    assert summarize_daily_nxt_unavailability_reasons([]) == "-"
 
 
 def test_daily_metrics_uses_official_warning_period() -> None:
