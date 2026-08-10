@@ -22,6 +22,7 @@ from src.analytics import (
     nxt_changes_to_frame,
     nxt_unavailability_events_to_frame,
     nxt_trading_status_to_frame,
+    summarize_daily_nxt_unavailability_reasons,
     summarize_nxt_membership_flow,
 )
 from src.cache import ResponseCache
@@ -3517,6 +3518,10 @@ def nxt_changes_page() -> None:
         start_date,
         end_date,
     )
+    eligibility_reason_counts = historical_store.list_nxt_eligibility_reason_counts(
+        start_date,
+        end_date,
+    )
     unavailability_events = historical_store.list_nxt_unavailability_events(
         start_date,
         end_date,
@@ -3570,6 +3575,9 @@ def nxt_changes_page() -> None:
     )
     with summary_tab:
         eligibility_by_date = {item.trade_date: item for item in eligibility}
+        reason_counts_by_date = {}
+        for item in eligibility_reason_counts:
+            reason_counts_by_date.setdefault(item.trade_date, []).append(item)
         summary_frame = metrics.sort_values("일자", ascending=False).rename(
             columns={
                 "당일 편입 종목수": "편입 종목수",
@@ -3586,12 +3594,18 @@ def nxt_changes_page() -> None:
                 current_date
             ].unavailable_stock_count
         )
+        summary_frame["거래불가사유"] = summary_frame["일자"].map(
+            lambda current_date: summarize_daily_nxt_unavailability_reasons(
+                reason_counts_by_date.get(current_date, [])
+            )
+        )
         summary_frame = summary_frame[
             [
                 "일자",
                 "NXT 종목수",
                 "거래가능 종목수",
                 "거래불가 종목수",
+                "거래불가사유",
                 "편입 종목수",
                 "편출 종목수",
                 "변경사유",
