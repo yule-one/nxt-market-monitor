@@ -176,6 +176,131 @@ def test_historical_store_builds_reclassified_daily_eligibility(tmp_path: Path) 
     assert reason_counts[("편출", "정기변경")] == 1
 
 
+def test_historical_store_materializes_unavailability_events(tmp_path: Path) -> None:
+    store = HistoricalMarketStore(tmp_path / "history.db")
+    first_date = date(2026, 8, 5)
+    second_date = date(2026, 8, 6)
+    third_date = date(2026, 8, 7)
+    first_statuses, _snapshot_data = _snapshot(first_date)
+    store.save_nxt_statuses(first_date, first_statuses)
+    store.save_nxt_statuses(
+        second_date,
+        [
+            NxtTradingStatus(
+                status_date=second_date,
+                stock_code="000660",
+                stock_name="SK하이닉스",
+                market="KOSPI",
+                tradable_market="전체",
+                unavailable_reason="",
+            ),
+            NxtTradingStatus(
+                status_date=second_date,
+                stock_code="005930",
+                stock_name="삼성전자",
+                market="KOSPI",
+                tradable_market="거래불가",
+                unavailable_reason="투자경고/위험",
+            ),
+        ],
+    )
+    store.save_nxt_statuses(
+        third_date,
+        [
+            NxtTradingStatus(
+                status_date=third_date,
+                stock_code="000660",
+                stock_name="SK하이닉스",
+                market="KOSPI",
+                tradable_market="전체",
+                unavailable_reason="",
+            )
+        ],
+    )
+
+    daily = store.list_nxt_daily_unavailability(first_date, third_date)
+    assert [(item.trade_date, item.stock_code) for item in daily] == [
+        (first_date, "000660"),
+        (second_date, "005930"),
+    ]
+    events = store.list_nxt_unavailability_events(first_date, third_date)
+    assert [
+        (item.event_date, item.stock_code, item.event_type)
+        for item in events
+    ] == [
+        (first_date, "000660", "거래불가"),
+        (second_date, "000660", "거래불가 해제"),
+        (second_date, "005930", "거래불가"),
+    ]
+    samsung = next(item for item in events if item.stock_code == "005930")
+    assert samsung.unavailable_reason == "투자경고/위험"
+    assert samsung.source_title == "NXT 거래현황"
+    coverage = store.nxt_unavailability_history_coverage()
+    assert coverage["row_count"] == 2
+    assert coverage["event_count"] == 3
+
+
+def test_unavailability_events_preserve_legacy_change_source(tmp_path: Path) -> None:
+    database_path = tmp_path / "history.db"
+    first_date = date(2025, 6, 19)
+    second_date = date(2025, 6, 20)
+    change_store = NxtChangeStore(database_path)
+    change_store.replace_range(
+        first_date,
+        second_date,
+        [
+            NxtChange(
+                change_date=first_date,
+                stock_code="005930",
+                stock_name="삼성전자",
+                market="KOSPI",
+                change_type="편출",
+                reason="투자경고/위험 지정",
+            ),
+            NxtChange(
+                change_date=second_date,
+                stock_code="005930",
+                stock_name="삼성전자",
+                market="KOSPI",
+                change_type="편입",
+                reason="투자경고/위험 해제",
+            ),
+        ],
+    )
+    store = HistoricalMarketStore(database_path)
+    store.save_nxt_statuses(
+        first_date,
+        [
+            NxtTradingStatus(
+                status_date=first_date,
+                stock_code="005930",
+                stock_name="삼성전자",
+                market="KOSPI",
+                tradable_market="거래불가",
+                unavailable_reason="투자경고/위험",
+            )
+        ],
+    )
+    store.save_nxt_statuses(
+        second_date,
+        [
+            NxtTradingStatus(
+                status_date=second_date,
+                stock_code="005930",
+                stock_name="삼성전자",
+                market="KOSPI",
+                tradable_market="전체",
+                unavailable_reason="",
+            )
+        ],
+    )
+
+    events = store.list_nxt_unavailability_events(first_date, second_date)
+    assert [item.event_type for item in events] == ["거래불가", "거래불가 해제"]
+    assert {item.source_type for item in events} == {"LEGACY_CHANGE"}
+    assert {item.source_title for item in events} == {"NXT 종목 변동내역"}
+
+
 def test_historical_store_round_trip_and_metrics(tmp_path: Path) -> None:
     store = HistoricalMarketStore(tmp_path / "history.db")
     trading_date = date(2026, 8, 5)

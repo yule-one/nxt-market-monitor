@@ -19,6 +19,7 @@ from src.analytics import (
     disclosures_to_frame,
     match_disclosures_to_nxt_status,
     nxt_changes_to_frame,
+    nxt_unavailability_events_to_frame,
     nxt_trading_status_to_frame,
 )
 from src.cache import ResponseCache
@@ -71,7 +72,7 @@ LOGGER = logging.getLogger(__name__)
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 11
-HISTORICAL_STORE_RUNTIME_VERSION = 12
+HISTORICAL_STORE_RUNTIME_VERSION = 13
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 4
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
@@ -382,6 +383,7 @@ def get_historical_market_store() -> HistoricalMarketStore:
             "load_nxt_limit_proximity_times",
             "load_nxt_limit_proximity_hits",
             "list_nxt_eligibility_summaries",
+            "list_nxt_unavailability_events",
         )
     ):
         _get_historical_market_store.clear()
@@ -3144,14 +3146,23 @@ def load_kind_disclosures(
     return disclosures, client.ssl_fallback_used
 
 
-def _date_controls(key_prefix: str, default_days: int = 14) -> tuple[date, date]:
+def _date_controls(
+    key_prefix: str,
+    default_days: int = 14,
+    *,
+    default_start: date | None = None,
+) -> tuple[date, date]:
     today = date.today()
-    default_start = max(NXT_LAUNCH_DATE, today - timedelta(days=default_days))
+    default_start_date = (
+        max(NXT_LAUNCH_DATE, min(default_start, today))
+        if default_start is not None
+        else max(NXT_LAUNCH_DATE, today - timedelta(days=default_days))
+    )
     start_col, end_col = st.columns(2)
     with start_col:
         start_date = st.date_input(
             "시작일",
-            value=default_start,
+            value=default_start_date,
             min_value=NXT_LAUNCH_DATE,
             max_value=today,
             key=f"{key_prefix}_start",
@@ -3456,16 +3467,31 @@ def nxt_stocks_page() -> None:
             st.info("해당 일자의 편입·편출 내역이 없습니다.")
         else:
             st.dataframe(change_frame, hide_index=True, use_container_width=True)
+
+
 def nxt_changes_page() -> None:
     st.title("NXT 정규시장 종목 변동내역")
-    start_date, end_date = _date_controls("nxt_changes", default_days=30)
+    start_date, end_date = _date_controls(
+        "nxt_changes_v2",
+        default_start=NXT_LAUNCH_DATE,
+    )
     changes = load_nxt_changes(start_date, end_date)
-    eligibility = get_historical_market_store().list_nxt_eligibility_summaries(
+    membership_changes = [
+        item
+        for item in changes
+        if classify_nxt_change(item) in {"편입", "편출"}
+    ]
+    historical_store = get_historical_market_store()
+    eligibility = historical_store.list_nxt_eligibility_summaries(
+        start_date,
+        end_date,
+    )
+    unavailability_events = historical_store.list_nxt_unavailability_events(
         start_date,
         end_date,
     )
     metrics = build_daily_nxt_metrics_from_counts(
-        changes,
+        membership_changes,
         {item.trade_date: item.target_stock_count for item in eligibility},
         start_date,
         end_date,
@@ -3491,17 +3517,15 @@ def nxt_changes_page() -> None:
     period_additions = len(
         {
             item.stock_code
-            for item in changes
-            if start_date <= item.change_date <= end_date
-            and classify_nxt_change(item) == "편입"
+            for item in membership_changes
+            if classify_nxt_change(item) == "편입"
         }
     )
     period_exclusions = len(
         {
             item.stock_code
-            for item in changes
-            if start_date <= item.change_date <= end_date
-            and classify_nxt_change(item) == "편출"
+            for item in membership_changes
+            if classify_nxt_change(item) == "편출"
         }
     )
     columns = st.columns(4)
@@ -3513,12 +3537,47 @@ def nxt_changes_page() -> None:
         f"{int(latest['NXT 종목수'] - first['NXT 종목수']):+,}",
     )
 
-    detail_tab, summary_tab = st.tabs(["종목별 변동내역", "일별 집계"])
-    with detail_tab:
-        period_changes = [
-            item for item in changes if start_date <= item.change_date <= end_date
+    summary_tab, detail_tab, unavailable_tab = st.tabs(
+        ["일별 집계", "종목별 변동내역", "거래불가 현황"]
+    )
+    with summary_tab:
+        eligibility_by_date = {item.trade_date: item for item in eligibility}
+        summary_frame = metrics.sort_values("일자", ascending=False).rename(
+            columns={
+                "당일 편입 종목수": "편입 종목수",
+                "당일 편출 종목수": "편출 종목수",
+            }
+        )
+        summary_frame["거래가능 종목수"] = summary_frame["일자"].map(
+            lambda current_date: eligibility_by_date[
+                current_date
+            ].tradable_stock_count
+        )
+        summary_frame["거래불가 종목수"] = summary_frame["일자"].map(
+            lambda current_date: eligibility_by_date[
+                current_date
+            ].unavailable_stock_count
+        )
+        summary_frame = summary_frame[
+            [
+                "일자",
+                "NXT 종목수",
+                "거래가능 종목수",
+                "거래불가 종목수",
+                "편입 종목수",
+                "편출 종목수",
+                "변경사유",
+            ]
         ]
-        change_frame = nxt_changes_to_frame(period_changes)
+        st.dataframe(
+            _style_daily_nxt_metrics(summary_frame),
+            hide_index=True,
+            use_container_width=True,
+            height=650,
+        )
+
+    with detail_tab:
+        change_frame = nxt_changes_to_frame(membership_changes)
         if change_frame.empty:
             st.info("선택한 기간의 NXT 편입·편출 내역이 없습니다.")
         else:
@@ -3530,19 +3589,48 @@ def nxt_changes_page() -> None:
                 height=650,
             )
 
-    with summary_tab:
-        summary_frame = metrics.sort_values("일자", ascending=False).rename(
-            columns={
-                "당일 편입 종목수": "편입 종목수",
-                "당일 편출 종목수": "편출 종목수",
-            }
+    with unavailable_tab:
+        unavailable_frame = nxt_unavailability_events_to_frame(
+            unavailability_events
         )
-        st.dataframe(
-            _style_daily_nxt_metrics(summary_frame),
-            hide_index=True,
-            use_container_width=True,
-            height=650,
+        unavailable_start_symbols = {
+            item.stock_code
+            for item in unavailability_events
+            if item.event_type == "거래불가"
+        }
+        unavailable_release_symbols = {
+            item.stock_code
+            for item in unavailability_events
+            if item.event_type == "거래불가 해제"
+        }
+        unavailable_columns = st.columns(2)
+        unavailable_columns[0].metric(
+            "조회기간 거래불가 종목수",
+            f"{len(unavailable_start_symbols):,}",
         )
+        unavailable_columns[1].metric(
+            "조회기간 거래불가 해제 종목수",
+            f"{len(unavailable_release_symbols):,}",
+        )
+        if unavailable_frame.empty:
+            st.info("선택한 기간의 거래불가 지정·해제 내역이 없습니다.")
+        else:
+            unavailable_frame = unavailable_frame.sort_values(
+                ["일자", "구분", "종목코드"],
+                ascending=[False, True, True],
+            )
+            st.dataframe(
+                unavailable_frame,
+                hide_index=True,
+                use_container_width=True,
+                height=650,
+                column_config={
+                    "원문": st.column_config.LinkColumn(
+                        "원문",
+                        display_text="원문 보기",
+                    )
+                },
+            )
 
     if SHOW_CHARTS:
         flow_chart = px.bar(
@@ -3572,6 +3660,8 @@ def nxt_changes_page() -> None:
         )
         _format_chart_date_axis(state_chart)
         st.plotly_chart(state_chart, use_container_width=True)
+
+
 def krx_market_actions_page() -> None:
     st.title("KRX 시장조치")
     st.caption("각 일자의 NXT 공식 거래현황 종목에 한정해 KRX 시장조치 상태와 공시 수를 조회합니다.")
