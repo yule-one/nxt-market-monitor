@@ -311,7 +311,7 @@ def nxt_changes_to_frame(changes: Sequence[NxtChange]) -> pd.DataFrame:
                 "변동내역": classify_nxt_change(item),
                 "변경사유": contextual_change_reason(item),
                 "데이터근거": source_context_for_change(item).source_title,
-                "보정여부": "보정" if item.is_inferred else "원본",
+                "보정여부": "보정" if getattr(item, "is_inferred", False) else "원본",
                 "원본변동내역": item.change_type,
                 "원본사유": item.reason,
             }
