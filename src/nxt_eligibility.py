@@ -10,6 +10,7 @@ from src.config import (
     TRADING_RESTRICTION_START_KEYWORDS,
 )
 from src.models import NxtChange, NxtTradingStatus
+from src.nxt_change_context import contextual_change_reason
 
 
 CHANGE_GROUPS = ("편입", "편출", "거래불가", "거래불가 해제")
@@ -285,7 +286,7 @@ def calculate_daily_eligibility(
     for item in change_rows:
         group = classify_nxt_change(item)
         classified_codes[group].add(item.stock_code)
-        reason = item.reason.strip() or "사유 미제공"
+        reason = contextual_change_reason(item)
         reason_codes[(group, reason)].add(item.stock_code)
 
     for item in unavailable_rows:

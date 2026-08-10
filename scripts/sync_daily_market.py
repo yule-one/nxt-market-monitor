@@ -19,6 +19,7 @@ from src.kis_rest import KisRestClient
 from src.kis_websocket import KisCredentials
 from src.krx_openapi import KrxOpenApiClient
 from src.nxt_client import NxtClient
+from src.nxt_change_store import NxtChangeStore
 from src.nxt_price_limits import reached_limit_points
 
 
@@ -166,6 +167,9 @@ def main() -> int:
             latest_final,
             target_date,
         )
+        inferred_count = NxtChangeStore(store.path).rebuild_inferred_changes()
+        store.rebuild_nxt_eligibility_history(NXT_LAUNCH_DATE, target_date)
+        logger.info("원본 누락 종목 변동 보정=%s건", inferred_count)
         return 0
 
     try:
@@ -206,11 +210,14 @@ def main() -> int:
                     trading_date,
                 )
         store.rebuild_derived_metrics()
+        inferred_count = NxtChangeStore(store.path).rebuild_inferred_changes()
+        store.rebuild_nxt_eligibility_history(NXT_LAUNCH_DATE, target_date)
         logger.info(
-            "당일 확정 데이터 동기화 완료: 범위=%s~%s 거래일=%s",
+            "당일 확정 데이터 동기화 완료: 범위=%s~%s 거래일=%s 변동보정=%s",
             start_date,
             target_date,
             completed,
+            inferred_count,
         )
         return 0
     except Exception:

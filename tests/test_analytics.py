@@ -147,7 +147,9 @@ def test_nxt_change_frame_uses_user_facing_column_names() -> None:
     assert frame.iloc[0]["상장시장"] == "KOSDAQ"
     assert frame.iloc[0]["변동내역"] == "편출"
     assert frame.iloc[0]["원본변동내역"] == "편출"
-    assert frame.iloc[0]["변동사유"] == "시장관리"
+    assert frame.iloc[0]["변경사유"] == "거래량한도관리"
+    assert frame.iloc[0]["원본사유"] == "시장관리"
+    assert frame.iloc[0]["보정여부"] == "원본"
     assert not {"시장", "변동", "사유"}.intersection(frame.columns)
 
 
