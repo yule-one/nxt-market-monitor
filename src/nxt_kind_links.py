@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Iterable, Sequence
 
 from src.models import Disclosure
@@ -20,7 +20,7 @@ KIND_LINK_CATEGORIES = (
     "단기과열종목",
     "기타시장안내",
 )
-KIND_LINK_LOOKBACK_DAYS = 20
+KIND_LINK_LOOKBACK_DAYS = 45
 
 _REASON_CATEGORIES = {
     "투자경고/위험": {
@@ -92,6 +92,15 @@ def _matches_event_direction(
     direction = _direction(disclosure.title, event.unavailable_reason)
     if direction == event.event_type:
         return True
+    if (
+        event.unavailable_reason == "거래정지"
+        and event.event_type == "거래불가"
+        and direction == "거래불가 해제"
+    ):
+        compact = _compact(disclosure.title)
+        # 한 공시에 정지와 해제가 함께 적힌 경우에도 해당 공시가 거래불가 구간의
+        # 최초 원인이 됩니다. 해제 이벤트는 아래의 구간 승계 로직에서 연결합니다.
+        return "정지" in compact and ("재개" in compact or "정지해제" in compact)
     if event.unavailable_reason != "단기과열" or event.event_type != "거래불가 해제":
         return False
     compact = _compact(disclosure.title)
@@ -102,7 +111,7 @@ def _matches_event_direction(
         "3거래일" in compact
         and "지정" in compact
         and "예고" not in compact
-        and 3 <= day_gap <= 9
+        and 3 <= day_gap
     )
 
 
@@ -170,10 +179,16 @@ def match_unavailability_event(
         return None
 
     gap = (event.event_date - selected.disclosure_date).days
+    selected_direction = _direction(selected.title, event.unavailable_reason)
+    is_combined_suspension_start = (
+        event.unavailable_reason == "거래정지"
+        and event.event_type == "거래불가"
+        and selected_direction == "거래불가 해제"
+    )
     is_short_period_end = (
         event.unavailable_reason == "단기과열"
         and event.event_type == "거래불가 해제"
-        and _direction(selected.title, event.unavailable_reason) == "거래불가"
+        and selected_direction == "거래불가"
     )
     return NxtUnavailabilityKindLink(
         event_date=event.event_date,
@@ -188,7 +203,11 @@ def match_unavailability_event(
             (
                 "종목코드·단기과열 지정기간 종료 일치, "
                 if is_short_period_end
-                else f"종목코드·거래불가사유·{event.event_type} 방향 일치, "
+                else (
+                    "종목코드·정지 및 해제 통합공시의 거래불가 구간 일치, "
+                    if is_combined_suspension_start
+                    else f"종목코드·거래불가사유·{event.event_type} 방향 일치, "
+                )
             )
             + f"KIND 공시일과 NXT 이벤트일 차이 {gap}일"
         ),
@@ -201,17 +220,71 @@ def match_unavailability_events(
     *,
     lookback_days: int = KIND_LINK_LOOKBACK_DAYS,
 ) -> list[NxtUnavailabilityKindLink]:
+    event_list = sorted(
+        list(events),
+        key=lambda item: (item.event_date, item.stock_code, item.event_type),
+    )
     by_stock: dict[str, list[Disclosure]] = defaultdict(list)
     for disclosure in disclosures:
         by_stock[disclosure.stock_code].append(disclosure)
 
-    matches: list[NxtUnavailabilityKindLink] = []
-    for event in events:
+    matches_by_key: dict[tuple[date, str, str], NxtUnavailabilityKindLink] = {}
+    for event in event_list:
         matched = match_unavailability_event(
             event,
             by_stock.get(event.stock_code, []),
             lookback_days=lookback_days,
         )
         if matched is not None:
-            matches.append(matched)
-    return matches
+            matches_by_key[(event.event_date, event.stock_code, event.event_type)] = matched
+
+    # NXT는 동일한 거래불가 구간의 시작과 해제를 별도 이벤트로 기록하지만,
+    # KIND는 시작 원문 하나만 공시하는 경우가 있습니다. 직접 매칭되지 않은 해제만
+    # 직전 시작 이벤트와 같은 구간일 때 그 원문을 승계합니다.
+    open_periods: dict[
+        str, tuple[NxtUnavailabilityEvent, NxtUnavailabilityKindLink]
+    ] = {}
+    for event in event_list:
+        key = (event.event_date, event.stock_code, event.event_type)
+        matched = matches_by_key.get(key)
+        if event.event_type == "거래불가":
+            if matched is not None:
+                open_periods[event.stock_code] = (event, matched)
+            else:
+                open_periods.pop(event.stock_code, None)
+            continue
+        if event.event_type != "거래불가 해제":
+            continue
+
+        prior = open_periods.pop(event.stock_code, None)
+        if matched is not None or prior is None:
+            continue
+        start_event, start_link = prior
+        same_reason = start_event.unavailable_reason == event.unavailable_reason
+        base_price_after_suspension = (
+            start_event.unavailable_reason == "거래정지"
+            and event.unavailable_reason == "시가기준가"
+        )
+        gap = (event.event_date - start_event.event_date).days
+        if (
+            not (same_reason or base_price_after_suspension)
+            or gap < 0
+            or gap > lookback_days
+        ):
+            continue
+        matches_by_key[key] = NxtUnavailabilityKindLink(
+            event_date=event.event_date,
+            stock_code=event.stock_code,
+            event_type=event.event_type,
+            report_no=start_link.report_no,
+            category=start_link.category,
+            title=start_link.title,
+            disclosed_at=start_link.disclosed_at,
+            viewer_url=start_link.viewer_url,
+            match_basis=(
+                "같은 종목의 연속된 거래불가 구간 원문 승계, "
+                f"시작 이벤트와 해제 이벤트 차이 {gap}일"
+            ),
+        )
+
+    return [matches_by_key[key] for key in sorted(matches_by_key)]
