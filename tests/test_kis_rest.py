@@ -8,6 +8,7 @@ import pytest
 from src.kis_rest import (
     IndexQuote,
     KisRestClient,
+    KisRestUniverseCollector,
     RestQuote,
     build_comparison_rows,
     build_market_pairs,
@@ -307,6 +308,27 @@ def test_market_pairs_use_two_slots_per_symbol() -> None:
         (NXT, "000660"),
         (KRX, "000660"),
     ]
+
+
+def test_universe_collector_pauses_during_nxt_morning_break(monkeypatch) -> None:
+    collector = KisRestUniverseCollector(object())  # type: ignore[arg-type]
+    waits: list[float] = []
+
+    class FakeStopEvent:
+        def wait(self, seconds: float) -> bool:
+            waits.append(seconds)
+            return False
+
+    collector._stop_event = FakeStopEvent()  # type: ignore[assignment]
+    monkeypatch.setattr("src.kis_rest.is_nxt_morning_break", lambda _now: True)
+    monkeypatch.setattr(
+        "src.kis_rest.seconds_until_nxt_morning_resume",
+        lambda _now: 420.0,
+    )
+
+    assert collector._pause_for_nxt_morning_break()
+    assert collector.status().state == "휴장 대기"
+    assert waits == [10.0]
 
 
 def test_rest_index_quotes_include_value_change_and_market_totals() -> None:
