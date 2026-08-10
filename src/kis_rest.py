@@ -308,6 +308,10 @@ class KisRestClient:
         # 한 번에 최대 120개 분봉이 반환되므로 가장 이른 수록 시각 직전으로
         # 커서를 옮겨 NXT의 하루 세션 전체를 역방향으로 조회합니다.
         for _ in range(10):
+            if is_nxt_morning_break():
+                raise KisRestError(
+                    "NXT 08:50~09:00 휴장으로 분봉 조회를 일시 중단했습니다."
+                )
             params = {
                 "FID_COND_MRKT_DIV_CODE": "NX",
                 "FID_INPUT_ISCD": symbol,
@@ -380,6 +384,10 @@ class KisRestClient:
         resolved: dict[str, str] = {}
 
         for cursor in cursors:
+            if is_nxt_morning_break():
+                raise KisRestError(
+                    "NXT 08:50~09:00 휴장으로 분봉 조회를 일시 중단했습니다."
+                )
             params = {
                 "FID_COND_MRKT_DIV_CODE": "NX",
                 "FID_INPUT_ISCD": symbol,
