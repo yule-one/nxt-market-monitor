@@ -130,8 +130,9 @@ Q1_2026_NEW_INFERRED_CODES = {
 
 
 def contextual_change_reason(change: NxtChange) -> str:
-    if change.display_reason:
-        return change.display_reason
+    display_reason = getattr(change, "display_reason", "")
+    if display_reason:
+        return display_reason
     if change.change_date == date(2026, 1, 2):
         if change.reason == "시장관리해소":
             return "2026년 1분기 정기변경(재편입)"
@@ -146,11 +147,13 @@ def contextual_change_reason(change: NxtChange) -> str:
 
 
 def source_context_for_change(change: NxtChange) -> ChangeContext:
-    if change.source_title or change.source_url:
+    source_title = getattr(change, "source_title", "")
+    source_url = getattr(change, "source_url", "")
+    if source_title or source_url:
         return ChangeContext(
             contextual_change_reason(change),
-            change.source_title or "NXT 종목 변동내역",
-            change.source_url or NXT_CHANGE_LIST_URL,
+            source_title or "NXT 종목 변동내역",
+            source_url or NXT_CHANGE_LIST_URL,
         )
     context = DATE_CONTEXTS.get(change.change_date)
     if change.change_date == date(2026, 1, 2) or (

@@ -153,6 +153,24 @@ def test_nxt_change_frame_uses_user_facing_column_names() -> None:
     assert not {"시장", "변동", "사유"}.intersection(frame.columns)
 
 
+def test_nxt_change_frame_accepts_cached_legacy_objects() -> None:
+    item = nxt_change(date(2025, 3, 5), "123450", "편출", "시장관리")
+    for field_name in (
+        "display_reason",
+        "source_title",
+        "source_url",
+        "basis",
+        "is_inferred",
+    ):
+        object.__delattr__(item, field_name)
+
+    frame = nxt_changes_to_frame([item])
+
+    assert frame.iloc[0]["변경사유"] == "거래량한도관리"
+    assert frame.iloc[0]["데이터근거"] == "NXT 종목 변동내역"
+    assert frame.iloc[0]["보정여부"] == "원본"
+
+
 def test_nxt_change_reclassifies_temporary_trading_restrictions() -> None:
     warning = nxt_change(
         date(2025, 4, 30),
