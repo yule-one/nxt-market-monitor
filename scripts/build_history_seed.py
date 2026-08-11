@@ -33,13 +33,10 @@ def main() -> None:
         parser.error(f"원본 DB가 없습니다: {source_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(
-        dir=output_path.parent,
-        prefix=".history-seed-",
-    ) as temporary_directory:
+    compressed_path: Path | None = None
+    with tempfile.TemporaryDirectory(prefix="history-seed-") as temporary_directory:
         temporary_root = Path(temporary_directory)
         snapshot_path = temporary_root / "history.db"
-        compressed_path = temporary_root / "history.db.gz"
         source = sqlite3.connect(source_path, timeout=30)
         target = sqlite3.connect(snapshot_path, timeout=30)
         try:
@@ -51,17 +48,27 @@ def main() -> None:
         finally:
             target.close()
             source.close()
-        with snapshot_path.open("rb") as source_file, compressed_path.open(
-            "wb"
-        ) as output_file:
-            with gzip.GzipFile(
-                filename="history.db",
-                mode="wb",
-                fileobj=output_file,
-                mtime=0,
-            ) as compressed_file:
-                shutil.copyfileobj(source_file, compressed_file)
-        os.replace(compressed_path, output_path)
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=output_path.parent,
+                prefix=".history-seed-",
+                suffix=".db.gz",
+                delete=False,
+            ) as temporary_output:
+                compressed_path = Path(temporary_output.name)
+                with snapshot_path.open("rb") as source_file:
+                    with gzip.GzipFile(
+                        filename="history.db",
+                        mode="wb",
+                        fileobj=temporary_output,
+                        mtime=0,
+                    ) as compressed_file:
+                        shutil.copyfileobj(source_file, compressed_file)
+            os.replace(compressed_path, output_path)
+            compressed_path = None
+        finally:
+            if compressed_path is not None:
+                compressed_path.unlink(missing_ok=True)
 
     print(
         f"history seed 생성 완료: {output_path} "

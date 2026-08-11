@@ -35,6 +35,7 @@
    - 시작일 기본값은 시장 개설일인 2025-03-04이며 `일별 집계`를 첫 화면으로 표시
    - 최초 10종목을 `최초` 사유의 편입으로 포함하고, 기간 편입 합계-편출 합계로 순증감을 계산
    - 편입·편출 종목수와 종목별 변동내역에 `변경사유` 표시
+   - 일별 NXT 대상 종목 중 KRX 공식 KOSPI200·KOSDAQ150 구성종목 수 표시
    - 거래불가·거래불가 해제는 편입·편출 표에서 제외하고 `거래불가 현황` 표로 분리
    - 2025-06-20까지는 종목 변동내역을 보완 근거로, 2025-06-23부터는 거래현황의 `거래가능시장·거래불가사유`를 우선 사용
    - 변동 API에 없는 편입·편출은 일별 대상 명단과 공식 공지로 대사해 보정
@@ -82,6 +83,7 @@ streamlit run app.py
 
 ```powershell
 python scripts\backfill_market_history.py --start 2025-03-04 --end 2026-08-06 --workers 4
+python scripts\backfill_krx_index_constituents.py --start 2025-03-04
 python scripts\build_history_seed.py
 ```
 
@@ -109,6 +111,15 @@ powershell -ExecutionPolicy Bypass -File scripts\register_nxt_change_task.ps1
 ```
 
 Streamlit 앱에도 동일한 누락 보충 스케줄러가 있어 앱 실행 중 자정 갱신과 앱 재시작 시 누락 보충을 수행합니다. DB 실행 잠금으로 Windows 작업과 앱 스케줄러가 동시에 같은 구간을 수집하지 않도록 했습니다.
+
+### KOSPI200·KOSDAQ150 구성종목 이력
+
+KRX OPEN API에는 지수 시세만 있고 구성종목 이력 API는 없으므로, KRX 지수 사이트의 공식 조회일자별 구성종목과 구성종목 변경내역을 사용합니다. 최신 구성종목에서 변경내역을 역적용해 NXT 거래일별 구성종목을 복원하고 `krx_index_constituents`에 저장합니다. 일별 집계 화면은 이 테이블과 NXT 매매체결대상 종목코드를 교차해 두 지수의 해당 종목수를 표시합니다.
+
+```powershell
+python scripts\backfill_krx_index_constituents.py --start 2025-03-04
+python scripts\build_history_seed.py
+```
 
 ### KOSPI200 선물 과거 데이터
 
@@ -149,7 +160,7 @@ python scripts\backfill_nxt_premarket.py --start 2026-08-06 --end 2026-08-06
 
 ### 익일 오전 08:00 확정 데이터 저장
 
-다음 작업은 KRX OPEN API 데이터가 갱신되는 익일 오전 08:00에 직전일의 NXT 종목별 확정 누적값, KRX 종목·지수 확정값, KOSPI200 선물 최근월물 값과 NXT 상·하한가 최초 도달시각을 `history.db`에 저장합니다. 첫 실행에 실패하면 1분 간격으로 최대 10회 자동 재시도합니다. 실행을 놓쳤으면 마지막 확정 저장일 다음 날부터 누락분을 보충하며, 휴장일은 저장하지 않습니다.
+다음 작업은 KRX OPEN API 데이터가 갱신되는 익일 오전 08:00에 직전일의 NXT 종목별 확정 누적값, KRX 종목·지수 확정값, KOSPI200 선물 최근월물 값, KOSPI200·KOSDAQ150 구성종목과 NXT 상·하한가 최초 도달시각을 `history.db`에 저장합니다. 첫 실행에 실패하면 1분 간격으로 최대 10회 자동 재시도합니다. 실행을 놓쳤으면 마지막 확정 저장일 다음 날부터 누락분을 보충하며, 휴장일은 저장하지 않습니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register_daily_market_task.ps1
@@ -163,6 +174,7 @@ powershell -ExecutionPolicy Bypass -File scripts\register_daily_market_task.ps1
 - [NXT 정규시장 거래현황](https://www.nextrade.co.kr/menu/transactionStatusMain/menuList.do)
 - [NXT 매매체결종목 변동내역](https://nextrade.co.kr/menu/transactionStatusConclusion/menuList.do)
 - [KRX Data Marketplace OPEN API](https://openapi.krx.co.kr/)
+- [KRX 지수 구성종목](https://data.krx.co.kr/contents/MDC/STAT/standard/MDCSTAT006.jsp)
 - [KRX 주식시장 거래시간·대량/바스켓 매매 안내](https://global.krx.co.kr/contents/GLB/01/0109/0109000000/guide_to_trading_in_the_korean_stock_market.pdf)
 
 NXT 시장 개설일인 2025-03-04 이후를 지원합니다. KIND와 NXT가 공개한 웹 응답 형식이 변경되면 파서 수정이 필요할 수 있습니다.
@@ -176,6 +188,7 @@ python scripts\export_nxt_eligibility_history.py --start-date 2025-03-04 --end-d
 ## 주요 지표 정의
 
 - `NXT 종목수`: 기준일의 NXT 매매체결대상 고유 종목 수. 거래불가 종목도 포함하며, 구형 원본에서 빠진 거래제한 종목은 지정·해제 변동으로 복원
+- `KOSPI200·KOSDAQ150 종목수`: 기준일의 NXT 매매체결대상 종목 중 각 KRX 대표지수 구성종목에 해당하는 고유 종목 수
 - `편입·편출 종목수`: 해당 일자의 실제 매매체결대상 선정 변동 수. 투자경고·투자위험·단기과열 지정/해제는 제외
 - `NXT 종목수 증감`: 조회기간의 일별 편입 종목수 합계-편출 종목수 합계. 2025-03-04 조회 시 최초 10종목을 편입에 포함
 - `변경사유`: 최초·단계별 확대·분기 정기변경·거래량한도관리·관리종목 지정·상장폐지 등 공식 공지와 원본 사유를 해석한 표시값

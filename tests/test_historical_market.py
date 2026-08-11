@@ -17,6 +17,7 @@ from src.historical_market import (
 )
 from src.kis_rest import FutureQuote, IndexQuote, NxtSessionQuote, RestQuote
 from src.krx_openapi import KrxDailySnapshot
+from src.krx_index_constituents import KrxIndexConstituent
 from src.market_realtime import KRX
 from src.models import NxtChange, NxtTradingStatus
 from src.nxt_change_store import NxtChangeStore
@@ -124,6 +125,32 @@ def _snapshot(trading_date: date) -> tuple[list[NxtTradingStatus], KrxDailySnaps
         {"005930": 5_969_782_550, "000660": 728_002_365, "999999": 1},
         futures,
     )
+
+
+def test_store_counts_nxt_members_in_krx_representative_indices(tmp_path: Path) -> None:
+    trading_date = date(2026, 8, 5)
+    store = HistoricalMarketStore(tmp_path / "history.db")
+    statuses, snapshot = _snapshot(trading_date)
+    store.save_historical_snapshot(trading_date, statuses, snapshot)
+    stored = store.replace_krx_index_constituents(
+        {
+            trading_date: {
+                "KOSPI200": [
+                    KrxIndexConstituent("KOSPI200", "005930", "삼성전자"),
+                    KrxIndexConstituent("KOSPI200", "999999", "비대상"),
+                ],
+                "KOSDAQ150": [
+                    KrxIndexConstituent("KOSDAQ150", "000660", "SK하이닉스")
+                ],
+            }
+        }
+    )
+
+    counts = store.list_nxt_index_member_counts(trading_date, trading_date)
+
+    assert stored == 3
+    assert counts[trading_date] == {"KOSDAQ150": 1, "KOSPI200": 1}
+    assert store.index_constituent_dates("KOSPI200") == {trading_date}
 
 
 def test_historical_store_builds_reclassified_daily_eligibility(tmp_path: Path) -> None:
