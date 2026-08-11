@@ -9,11 +9,12 @@ import threading
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from src.config import NXT_CHANGE_PAGE_URL, NXT_TRADING_STATUS_PAGE_URL
 from src.krx_openapi import KrxDailySnapshot
+from src.krx_index_constituents import KrxIndexConstituent
 from src.kis_rest import FutureQuote, IndexQuote, NxtSessionQuote, RestQuote
 from src.market_realtime import KRX
 from src.models import NxtChange, NxtTradingStatus
@@ -503,6 +504,15 @@ class HistoricalMarketStore:
                     PRIMARY KEY (trade_date, index_name)
                 );
 
+                CREATE TABLE IF NOT EXISTS krx_index_constituents (
+                    trade_date TEXT NOT NULL,
+                    index_name TEXT NOT NULL,
+                    stock_code TEXT NOT NULL,
+                    stock_name TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (trade_date, index_name, stock_code)
+                );
+
                 CREATE TABLE IF NOT EXISTS krx_daily_futures (
                     trade_date TEXT NOT NULL,
                     future_name TEXT NOT NULL,
@@ -630,6 +640,8 @@ class HistoricalMarketStore:
                     ON nxt_unavailability_kind_links(report_no);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_quotes_date
                     ON krx_daily_quotes(trade_date);
+                CREATE INDEX IF NOT EXISTS idx_krx_index_constituents_code
+                    ON krx_index_constituents(trade_date, stock_code, index_name);
                 CREATE INDEX IF NOT EXISTS idx_krx_daily_futures_date
                     ON krx_daily_futures(trade_date);
                 CREATE INDEX IF NOT EXISTS idx_market_daily_fx_date
@@ -2199,6 +2211,108 @@ class HistoricalMarketStore:
                 (index_name,),
             ).fetchall()
         return {date.fromisoformat(str(row["trade_date"])) for row in rows}
+
+    def replace_krx_index_constituents(
+        self,
+        history: Mapping[
+            date,
+            Mapping[str, Iterable[KrxIndexConstituent]],
+        ],
+    ) -> int:
+        """조회일자별 KRX 지수 구성종목을 원자적으로 교체합니다."""
+
+        updated_at = datetime.now(timezone.utc).isoformat()
+        stored = 0
+        with self._lock, self._connect() as connection:
+            for trading_date, indices in history.items():
+                date_key = trading_date.isoformat()
+                for index_name, constituents in indices.items():
+                    rows = [
+                        (
+                            date_key,
+                            index_name,
+                            item.stock_code,
+                            item.stock_name,
+                            updated_at,
+                        )
+                        for item in constituents
+                        if item.stock_code
+                    ]
+                    connection.execute(
+                        "DELETE FROM krx_index_constituents "
+                        "WHERE trade_date = ? AND index_name = ?",
+                        (date_key, index_name),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO krx_index_constituents (
+                            trade_date, index_name, stock_code, stock_name,
+                            updated_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                    stored += len(rows)
+        return stored
+
+    def index_constituent_dates(self, index_name: str) -> set[date]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT trade_date
+                FROM krx_index_constituents
+                WHERE index_name = ?
+                """,
+                (index_name,),
+            ).fetchall()
+        return {date.fromisoformat(str(row["trade_date"])) for row in rows}
+
+    def list_nxt_index_member_counts(
+        self,
+        start_date: date,
+        end_date: date,
+    ) -> dict[date, dict[str, int]]:
+        """일별 NXT 대상 종목 중 KRX 대표지수 구성종목 수를 반환합니다."""
+
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                WITH nxt_symbols AS (
+                    SELECT trade_date, stock_code
+                    FROM nxt_daily_quotes
+                    WHERE trade_date BETWEEN ? AND ?
+                    UNION
+                    SELECT trade_date, stock_code
+                    FROM nxt_daily_eligibility_adjustments
+                    WHERE trade_date BETWEEN ? AND ?
+                )
+                SELECT member.trade_date, member.index_name,
+                       COUNT(DISTINCT member.stock_code) AS stock_count
+                FROM krx_index_constituents AS member
+                JOIN nxt_symbols AS nxt
+                  ON nxt.trade_date = member.trade_date
+                 AND nxt.stock_code = member.stock_code
+                WHERE member.trade_date BETWEEN ? AND ?
+                  AND member.index_name IN ('KOSPI200', 'KOSDAQ150')
+                GROUP BY member.trade_date, member.index_name
+                ORDER BY member.trade_date, member.index_name
+                """,
+                (
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                ),
+            ).fetchall()
+        result: dict[date, dict[str, int]] = {}
+        for row in rows:
+            trading_date = date.fromisoformat(str(row["trade_date"]))
+            result.setdefault(trading_date, {})[str(row["index_name"])] = int(
+                row["stock_count"]
+            )
+        return result
 
     def fx_dates(self, pair_name: str = "달러-원") -> set[date]:
         with self._lock, self._connect() as connection:

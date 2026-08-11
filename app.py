@@ -75,7 +75,7 @@ LOGGER = logging.getLogger(__name__)
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 11
-HISTORICAL_STORE_RUNTIME_VERSION = 14
+HISTORICAL_STORE_RUNTIME_VERSION = 15
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 4
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
@@ -387,6 +387,7 @@ def get_historical_market_store() -> HistoricalMarketStore:
             "load_nxt_limit_proximity_hits",
             "list_nxt_eligibility_summaries",
             "list_nxt_unavailability_events",
+            "list_nxt_index_member_counts",
         )
     ):
         _get_historical_market_store.clear()
@@ -3532,6 +3533,14 @@ def nxt_changes_page() -> None:
         start_date,
         end_date,
     )
+    index_member_counts = historical_store.list_nxt_index_member_counts(
+        start_date,
+        end_date,
+    )
+    index_coverage = {
+        index_name: historical_store.index_constituent_dates(index_name)
+        for index_name in ("KOSPI200", "KOSDAQ150")
+    }
     sync_stats = get_nxt_change_store().stats()
     if sync_stats.coverage_start and sync_stats.coverage_end:
         last_success = (
@@ -3599,10 +3608,22 @@ def nxt_changes_page() -> None:
                 reason_counts_by_date.get(current_date, [])
             )
         )
+        for index_name in ("KOSPI200", "KOSDAQ150"):
+            summary_frame[f"{index_name} 종목수"] = pd.array(
+                [
+                    index_member_counts.get(current_date, {}).get(index_name, 0)
+                    if current_date in index_coverage[index_name]
+                    else pd.NA
+                    for current_date in summary_frame["일자"]
+                ],
+                dtype="Int64",
+            )
         summary_frame = summary_frame[
             [
                 "일자",
                 "NXT 종목수",
+                "KOSPI200 종목수",
+                "KOSDAQ150 종목수",
                 "거래가능 종목수",
                 "거래불가 종목수",
                 "거래불가사유",
@@ -3617,6 +3638,19 @@ def nxt_changes_page() -> None:
             use_container_width=True,
             height=650,
         )
+        missing_index_dates = {
+            current_date
+            for current_date in summary_frame["일자"]
+            if any(
+                current_date not in index_coverage[index_name]
+                for index_name in ("KOSPI200", "KOSDAQ150")
+            )
+        }
+        if missing_index_dates:
+            st.caption(
+                f"KRX 지수 구성종목이 아직 DB에 적재되지 않은 거래일이 "
+                f"{len(missing_index_dates):,}일 있어 해당 종목수는 빈칸으로 표시됩니다."
+            )
 
     with detail_tab:
         change_frame = nxt_changes_display_frame(membership_changes)
@@ -3725,6 +3759,10 @@ def nxt_changes_page() -> None:
             (
                 "공식 변동내역 없이 명단에서 사라지거나 추가된 종목은 일별 대상 명단과 "
                 "공식 안내를 대사해 보정하며, 보정 여부와 근거를 함께 표시합니다."
+            ),
+            (
+                "KOSPI200·KOSDAQ150 종목수는 각 일자의 NXT 매매체결대상 종목과 "
+                "KRX 공식 지수 구성종목을 종목코드로 대조한 값입니다."
             ),
             "이 화면은 외부 API를 호출하지 않고 SQLite에 저장된 값만 조회합니다.",
         ]

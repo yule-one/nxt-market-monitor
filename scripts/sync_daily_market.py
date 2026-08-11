@@ -19,6 +19,11 @@ from src.kind_client import KindClient
 from src.kis_rest import KisRestClient
 from src.kis_websocket import KisCredentials
 from src.krx_openapi import KrxOpenApiClient
+from src.krx_index_constituents import (
+    KRX_INDEX_SPECS,
+    KrxIndexConstituentClient,
+    build_index_constituent_histories,
+)
 from src.nxt_client import NxtClient
 from src.nxt_change_store import NxtChangeStore
 from src.nxt_kind_links import (
@@ -167,6 +172,38 @@ def _sync_nxt_unavailability_kind_links(
     )
 
 
+def _sync_krx_index_constituents(
+    store: HistoricalMarketStore,
+    end_date: date,
+    logger: logging.Logger,
+) -> None:
+    summaries = store.list_nxt_eligibility_summaries(NXT_LAUNCH_DATE, end_date)
+    target_dates = sorted(item.trade_date for item in summaries)
+    if not target_dates:
+        return
+    targets_by_index: dict[str, list[date]] = {}
+    for index_name in KRX_INDEX_SPECS:
+        existing = store.index_constituent_dates(index_name)
+        missing = [item for item in target_dates if item not in existing]
+        if missing:
+            targets_by_index[index_name] = missing
+    if not targets_by_index:
+        return
+    client = KrxIndexConstituentClient()
+    history = build_index_constituent_histories(
+        client,
+        targets_by_index,
+        anchor_date=target_dates[-1],
+    )
+    stored = store.replace_krx_index_constituents(history)
+    logger.info(
+        "KRX 지수 구성종목 저장 완료: 기준일=%s 날짜=%s 행=%s",
+        target_dates[-1],
+        sum(len(items) for items in targets_by_index.values()),
+        stored,
+    )
+
+
 def _target_date(now: datetime) -> date:
     """Return the previous Korean calendar day for the 08:00 daily job."""
     local_now = now.astimezone(KST)
@@ -209,6 +246,10 @@ def main() -> int:
         )
         inferred_count = NxtChangeStore(store.path).rebuild_inferred_changes()
         store.rebuild_nxt_eligibility_history(NXT_LAUNCH_DATE, target_date)
+        try:
+            _sync_krx_index_constituents(store, target_date, logger)
+        except Exception:
+            logger.exception("KRX 지수 구성종목 동기화 실패: 목표=%s", target_date)
         try:
             _sync_nxt_unavailability_kind_links(
                 store,
@@ -264,6 +305,10 @@ def main() -> int:
         store.rebuild_derived_metrics()
         inferred_count = NxtChangeStore(store.path).rebuild_inferred_changes()
         store.rebuild_nxt_eligibility_history(NXT_LAUNCH_DATE, target_date)
+        try:
+            _sync_krx_index_constituents(store, target_date, logger)
+        except Exception:
+            logger.exception("KRX 지수 구성종목 동기화 실패: 목표=%s", target_date)
         try:
             _sync_nxt_unavailability_kind_links(
                 store,
