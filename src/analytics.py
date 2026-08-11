@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from html import escape
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
@@ -349,17 +348,14 @@ def nxt_unavailability_events_to_frame(
     """거래불가 현황 화면에 필요한 사용자 표시 칼럼만 반환합니다."""
 
     def kind_disclosure_link(title: str, viewer_url: str) -> str:
-        display_title = str(title or "").strip()
-        if not display_title:
+        display_title = re.sub(r"[\r\n]+", " ", str(title or "")).strip()
+        original_url = str(viewer_url or "").strip()
+        if not display_title or not original_url:
             return ""
-        safe_title = escape(display_title)
-        safe_url = escape(str(viewer_url or "").strip(), quote=True)
-        if not safe_url:
-            return safe_title
-        return (
-            f'<a href="{safe_url}" target="_blank" '
-            f'rel="noopener noreferrer">{safe_title}</a>'
-        )
+        # LinkColumn은 URL 하나만 값으로 받습니다. 서버에 전달되지 않는 fragment에
+        # 제목을 넣고 display_text 정규식으로 제목만 표시합니다.
+        original_url = original_url.split("#", 1)[0]
+        return f"{original_url}#kind-title={display_title}"
 
     return pd.DataFrame.from_records(
         [

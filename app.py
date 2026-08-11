@@ -3726,15 +3726,17 @@ def nxt_changes_page() -> None:
                     "KIND 공시",
                 ]
             ]
-            unavailable_display = unavailable_frame.style.format(
-                {"KIND 공시": lambda value: value},
-                escape=None,
-            )
             st.dataframe(
-                unavailable_display,
+                unavailable_frame,
                 hide_index=True,
                 use_container_width=True,
                 height=650,
+                column_config={
+                    "KIND 공시": st.column_config.LinkColumn(
+                        "KIND 공시",
+                        display_text=r"#kind-title=(.*)$",
+                    )
+                },
             )
 
     if SHOW_CHARTS:
