@@ -13,11 +13,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from src.cache import ResponseCache
 from src.http import ResilientSession
 from src.kis_master import fetch_listed_shares as fetch_kis_listed_shares
 from src.kis_websocket import KisCredentials
 from src.market_realtime import KRX, NXT, WatchSymbol
 from src.nxt_api_control import (
+    is_nxt_api_collection_window,
     is_nxt_morning_break,
     seconds_until_nxt_morning_resume,
 )
@@ -182,11 +184,13 @@ class KisRestClient:
         base_url: str = KIS_REST_BASE_URL,
         min_request_interval: float = 0.09,
         token_cache_path: Path | None = None,
+        response_cache: ResponseCache | None = None,
     ) -> None:
         self.credentials = credentials
         self.session = session or ResilientSession()
         self.base_url = base_url.rstrip("/")
         self.min_request_interval = min_request_interval
+        self.response_cache = response_cache
         self.token_cache_path = (
             token_cache_path
             if token_cache_path is not None
@@ -836,10 +840,32 @@ class KisRestClient:
             if self._listed_shares_date == today and self._listed_shares:
                 return dict(self._listed_shares)
 
+            if self.response_cache is not None:
+                cached = self.response_cache.get(
+                    "kis_listed_shares_v1",
+                    today.isoformat(),
+                )
+                if isinstance(cached, dict):
+                    normalized = {
+                        str(symbol): int(shares)
+                        for symbol, shares in cached.items()
+                        if str(symbol) and int(shares) > 0
+                    }
+                    if normalized:
+                        self._listed_shares = normalized
+                        self._listed_shares_date = today
+                        return dict(self._listed_shares)
+
         shares = fetch_kis_listed_shares(self.session)
         with self._listed_shares_lock:
             self._listed_shares = shares
             self._listed_shares_date = today
+            if self.response_cache is not None and shares:
+                self.response_cache.set(
+                    "kis_listed_shares_v1",
+                    today.isoformat(),
+                    shares,
+                )
             return dict(self._listed_shares)
 
     def _fetch_index_quote(
@@ -1036,10 +1062,12 @@ class KisRestUniverseCollector:
         *,
         symbols_per_request: int = 15,
         heartbeat_timeout: float = 20.0,
+        response_cache: ResponseCache | None = None,
     ) -> None:
         if not 1 <= symbols_per_request <= 15:
             raise ValueError("KRX/NXT 동시 조회는 요청당 최대 15종목입니다.")
         self.client = client
+        self.response_cache = response_cache
         self.symbols_per_request = symbols_per_request
         self.heartbeat_timeout = heartbeat_timeout
         self._lock = threading.RLock()
@@ -1048,6 +1076,8 @@ class KisRestUniverseCollector:
         self._index_quotes: dict[str, IndexQuote] = {}
         self._future_quotes: dict[str, FutureQuote] = {}
         self._listed_shares: dict[str, int] = {}
+        self._static_quote_date: date | None = None
+        self._static_quotes: dict[tuple[str, str], dict[str, int | None]] = {}
         self._interval = 10.0
         self._revision = 0
         self._thread: threading.Thread | None = None
@@ -1142,6 +1172,97 @@ class KisRestUniverseCollector:
         self._stop_event.wait(min(max(wait_seconds, 1.0), 10.0))
         return True
 
+    def _pause_outside_collection_window(self) -> bool:
+        now = datetime.now(KST)
+        if is_nxt_api_collection_window(now):
+            return False
+        self._set_status("운영시간 외", "NXT REST 자동 수집시간 08:00~20:05 외 조회 중지")
+        self._stop_event.wait(10.0)
+        return True
+
+    @staticmethod
+    def _static_quote_cache_key(quote: RestQuote) -> tuple[str, str]:
+        return quote.symbol, quote.market
+
+    def _load_daily_static_quotes(self, trading_date: date) -> None:
+        with self._lock:
+            if self._static_quote_date == trading_date:
+                return
+            self._static_quote_date = trading_date
+            self._static_quotes = {}
+        if self.response_cache is None:
+            return
+        cached = self.response_cache.get(
+            "kis_daily_static_quotes_v1",
+            trading_date.isoformat(),
+        )
+        if not isinstance(cached, dict):
+            return
+        normalized: dict[tuple[str, str], dict[str, int | None]] = {}
+        for raw_key, raw_values in cached.items():
+            if not isinstance(raw_values, dict) or ":" not in str(raw_key):
+                continue
+            symbol, market = str(raw_key).split(":", 1)
+            normalized[(symbol, market)] = {
+                field: (
+                    int(raw_values[field])
+                    if raw_values.get(field) is not None
+                    else None
+                )
+                for field in (
+                    "reference_price",
+                    "upper_limit_price",
+                    "lower_limit_price",
+                )
+            }
+        with self._lock:
+            if self._static_quote_date == trading_date:
+                self._static_quotes = normalized
+
+    def _cache_daily_static_quotes(
+        self,
+        quotes: list[RestQuote],
+        trading_date: date,
+    ) -> list[RestQuote]:
+        """당일 최초 정적 시세를 고정해 모든 사용자에게 같은 값을 제공합니다."""
+
+        self._load_daily_static_quotes(trading_date)
+        changed = False
+        stabilized: list[RestQuote] = []
+        with self._lock:
+            for quote in quotes:
+                key = self._static_quote_cache_key(quote)
+                static_values = self._static_quotes.get(key)
+                if static_values is None:
+                    static_values = {
+                        "reference_price": quote.reference_price,
+                        "upper_limit_price": quote.upper_limit_price,
+                        "lower_limit_price": quote.lower_limit_price,
+                    }
+                    self._static_quotes[key] = static_values
+                    changed = True
+                else:
+                    for field in (
+                        "reference_price",
+                        "upper_limit_price",
+                        "lower_limit_price",
+                    ):
+                        if static_values.get(field) is None and getattr(quote, field) is not None:
+                            static_values[field] = getattr(quote, field)
+                            changed = True
+                stabilized.append(replace(quote, **static_values))
+            cache_payload = {
+                f"{symbol}:{market}": dict(values)
+                for (symbol, market), values in self._static_quotes.items()
+            }
+        if changed and self.response_cache is not None:
+            self.response_cache.set(
+                "kis_daily_static_quotes_v1",
+                trading_date.isoformat(),
+                cache_payload,
+            )
+        return stabilized
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             with self._lock:
@@ -1157,12 +1278,16 @@ class KisRestUniverseCollector:
                 self._set_status("대기", "조회할 NXT 종목이 없음")
                 self._stop_event.wait(1)
                 continue
+            if self._pause_outside_collection_window():
+                continue
             if self._pause_for_nxt_morning_break():
                 continue
 
             cycle_started = time.monotonic()
             try:
                 self._set_status("갱신 중", "NXT 전종목 KRX/NXT 누적 시세 조회 중")
+                if self._pause_outside_collection_window():
+                    continue
                 if self._pause_for_nxt_morning_break():
                     continue
                 try:
@@ -1199,6 +1324,9 @@ class KisRestUniverseCollector:
                 for start in range(0, len(symbols), self.symbols_per_request):
                     if self._stop_event.is_set():
                         return
+                    if self._pause_outside_collection_window():
+                        paused_for_break = True
+                        break
                     if self._pause_for_nxt_morning_break():
                         paused_for_break = True
                         break
@@ -1207,6 +1335,10 @@ class KisRestUniverseCollector:
                             break
                     chunk = symbols[start : start + self.symbols_per_request]
                     quotes = self.client.fetch_quotes(build_market_pairs(chunk))
+                    quotes = self._cache_daily_static_quotes(
+                        quotes,
+                        datetime.now(KST).date(),
+                    )
                     with self._lock:
                         for quote in quotes:
                             self._quotes[(quote.symbol, quote.market)] = quote

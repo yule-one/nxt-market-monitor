@@ -10,8 +10,21 @@ from zoneinfo import ZoneInfo
 
 
 KST = ZoneInfo("Asia/Seoul")
+NXT_API_COLLECTION_START = datetime_time(8, 0)
+NXT_API_COLLECTION_END = datetime_time(20, 5)
 NXT_MORNING_BREAK_START = datetime_time(8, 50)
 NXT_MORNING_BREAK_END = datetime_time(9, 0)
+
+
+def is_nxt_api_collection_window(moment: datetime | None = None) -> bool:
+    """NXT 장중 API 자동 수집 운영시간(08:00~20:05)인지 반환합니다."""
+
+    current = moment or datetime.now(KST)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=KST)
+    else:
+        current = current.astimezone(KST)
+    return NXT_API_COLLECTION_START <= current.time() < NXT_API_COLLECTION_END
 
 
 def is_nxt_morning_break(moment: datetime | None = None) -> bool:

@@ -54,7 +54,11 @@ from src.kis_websocket import KisCredentials, KisRealtimeCollector
 from src.market_realtime import NXT, MarketAggregator, MarketDataStore, WatchSymbol
 from src.models import NxtTradingStatus
 from src.nxt_client import NxtClient
-from src.nxt_api_control import NxtMinuteLookupGate, is_nxt_morning_break
+from src.nxt_api_control import (
+    NxtMinuteLookupGate,
+    is_nxt_api_collection_window,
+    is_nxt_morning_break,
+)
 from src.nxt_price_limits import (
     first_limit_proximity_time,
     format_limit_hit_time,
@@ -74,10 +78,10 @@ LOGGER = logging.getLogger(__name__)
 
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
-REST_UNIVERSE_RUNTIME_VERSION = 11
+REST_UNIVERSE_RUNTIME_VERSION = 12
 HISTORICAL_STORE_RUNTIME_VERSION = 15
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
-KIS_SHARED_CLIENT_RUNTIME_VERSION = 4
+KIS_SHARED_CLIENT_RUNTIME_VERSION = 5
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
 KIS_MINUTE_REQUEST_INTERVAL_SECONDS = 1.0
 NXT_LIMIT_PROXIMITY_TICKS = 3
@@ -448,6 +452,7 @@ def get_shared_kis_rest_client(
     return KisRestClient(
         KisCredentials(app_key=app_key, app_secret=app_secret),
         min_request_interval=KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS,
+        response_cache=get_response_cache(),
     )
 
 
@@ -497,7 +502,7 @@ def get_rest_universe_runtime(
         app_secret,
         KIS_SHARED_CLIENT_RUNTIME_VERSION,
     )
-    return KisRestUniverseCollector(client)
+    return KisRestUniverseCollector(client, response_cache=get_response_cache())
 
 
 def _secret_value(name: str) -> str:
@@ -1849,7 +1854,9 @@ def _render_history_ratio_charts(
     end_date: date,
 ) -> None:
     st.markdown("#### NXT/KRX 거래 비율 추이")
-    daily_tab, cumulative_tab = st.tabs(["거래량비율 · 일일", "거래량비율 · 6개월 누적"])
+    cumulative_tab, daily_tab = st.tabs(
+        ["거래량비율 · 6개월 누적", "거래량비율 · 일일"]
+    )
     daily_volume = frame[["일자", "거래량비율"]].dropna().copy()
     daily_volume["거래량비율"] = daily_volume["거래량비율"] * 100
     daily_tab.plotly_chart(
@@ -2412,6 +2419,11 @@ def _resolve_nxt_limit_hit_times(
             resolved,
             "NXT 08:50~09:00 휴장으로 시세·분봉 조회를 일시 중지합니다.",
         )
+    if not is_nxt_api_collection_window(now.to_pydatetime()):
+        return (
+            resolved,
+            "NXT REST 자동 수집시간(08:00~20:05) 밖에는 분봉 조회를 중지합니다.",
+        )
     earliest_available = (pd.Timestamp(today) - pd.DateOffset(years=1)).date()
     if selected_date < earliest_available:
         return (
@@ -2505,6 +2517,11 @@ def _resolve_nxt_limit_proximity_times(
         return (
             resolved,
             "NXT 08:50~09:00 휴장으로 시세·분봉 조회를 일시 중지합니다.",
+        )
+    if not is_nxt_api_collection_window(now.to_pydatetime()):
+        return (
+            resolved,
+            "NXT REST 자동 수집시간(08:00~20:05) 밖에는 분봉 조회를 중지합니다.",
         )
     earliest_available = (pd.Timestamp(today) - pd.DateOffset(years=1)).date()
     if selected_date < earliest_available:
@@ -3589,6 +3606,7 @@ def nxt_changes_page() -> None:
             reason_counts_by_date.setdefault(item.trade_date, []).append(item)
         summary_frame = metrics.sort_values("일자", ascending=False).rename(
             columns={
+                "NXT 종목수": "종목수",
                 "당일 편입 종목수": "편입 종목수",
                 "당일 편출 종목수": "편출 종목수",
             }
@@ -3609,7 +3627,8 @@ def nxt_changes_page() -> None:
             )
         )
         for index_name in ("KOSPI200", "KOSDAQ150"):
-            summary_frame[f"{index_name} 종목수"] = pd.array(
+            display_name = "코스피200" if index_name == "KOSPI200" else "코스닥150"
+            summary_frame[display_name] = pd.array(
                 [
                     index_member_counts.get(current_date, {}).get(index_name, 0)
                     if current_date in index_coverage[index_name]
@@ -3621,9 +3640,9 @@ def nxt_changes_page() -> None:
         summary_frame = summary_frame[
             [
                 "일자",
-                "NXT 종목수",
-                "KOSPI200 종목수",
-                "KOSDAQ150 종목수",
+                "종목수",
+                "코스피200",
+                "코스닥150",
                 "거래가능 종목수",
                 "거래불가 종목수",
                 "거래불가사유",
@@ -3695,15 +3714,28 @@ def nxt_changes_page() -> None:
                 ["일자", "구분", "종목코드"],
                 ascending=[False, True, True],
             )
+            unavailable_frame = unavailable_frame[
+                [
+                    "일자",
+                    "종목코드",
+                    "종목명",
+                    "상장시장",
+                    "구분",
+                    "거래가능시장",
+                    "거래불가사유",
+                    "판단근거",
+                    "KIND 공시",
+                ]
+            ]
             st.dataframe(
                 unavailable_frame,
                 hide_index=True,
                 use_container_width=True,
                 height=650,
                 column_config={
-                    "원문": st.column_config.LinkColumn(
-                        "원문",
-                        display_text="원문 보기",
+                    "KIND 공시": st.column_config.LinkColumn(
+                        "KIND 공시",
+                        display_text="원문보기",
                     )
                 },
             )

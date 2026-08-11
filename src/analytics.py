@@ -345,6 +345,8 @@ def nxt_changes_display_frame(changes: Sequence[NxtChange]) -> pd.DataFrame:
 def nxt_unavailability_events_to_frame(
     events: Sequence[NxtUnavailabilityEvent],
 ) -> pd.DataFrame:
+    """거래불가 현황 화면에 필요한 사용자 표시 칼럼만 반환합니다."""
+
     return pd.DataFrame.from_records(
         [
             {
@@ -355,11 +357,8 @@ def nxt_unavailability_events_to_frame(
                 "구분": item.event_type,
                 "거래가능시장": item.tradable_market,
                 "거래불가사유": item.unavailable_reason,
-                "데이터근거": item.source_title,
                 "판단근거": item.basis,
-                "원문구분": "KIND" if item.kind_viewer_url else "",
-                "KIND 공시": item.kind_title or "",
-                "원문": item.kind_viewer_url or "",
+                "KIND 공시": item.kind_viewer_url or "",
             }
             for item in events
         ]

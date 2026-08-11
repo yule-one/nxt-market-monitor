@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from src.cache import ResponseCache
 from src.kis_rest import (
     IndexQuote,
     KisRestClient,
@@ -352,6 +353,136 @@ def test_universe_collector_pauses_during_nxt_morning_break(monkeypatch) -> None
     assert collector._pause_for_nxt_morning_break()
     assert collector.status().state == "휴장 대기"
     assert waits == [10.0]
+
+
+def test_universe_collector_pauses_outside_collection_window(monkeypatch) -> None:
+    collector = KisRestUniverseCollector(object())  # type: ignore[arg-type]
+    waits: list[float] = []
+
+    class FakeStopEvent:
+        def wait(self, seconds: float) -> bool:
+            waits.append(seconds)
+            return False
+
+    collector._stop_event = FakeStopEvent()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        "src.kis_rest.is_nxt_api_collection_window",
+        lambda _now: False,
+    )
+
+    assert collector._pause_outside_collection_window()
+    assert collector.status().state == "운영시간 외"
+    assert waits == [10.0]
+
+
+def test_universe_collector_is_shared_across_five_session_starts(monkeypatch) -> None:
+    created_threads: list[object] = []
+
+    class FakeThread:
+        def __init__(self, **_kwargs: object) -> None:
+            self.alive = False
+            created_threads.append(self)
+
+        def start(self) -> None:
+            self.alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    monkeypatch.setattr("src.kis_rest.threading.Thread", FakeThread)
+    collector = KisRestUniverseCollector(object())  # type: ignore[arg-type]
+    symbols = [WatchSymbol("005930", "삼성전자")]
+
+    for _ in range(5):
+        collector.start(symbols, 10)
+
+    assert len(created_threads) == 1
+
+
+def test_listed_shares_are_reused_from_daily_sqlite_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cache = ResponseCache(tmp_path / "cache.db")
+    calls: list[int] = []
+
+    def fake_fetch(_session: object) -> dict[str, int]:
+        calls.append(1)
+        return {"005930": 5_919_638_922}
+
+    monkeypatch.setattr("src.kis_rest.fetch_kis_listed_shares", fake_fetch)
+    first = KisRestClient(
+        KisCredentials("key", "secret"),
+        session=FakeSession(),  # type: ignore[arg-type]
+        base_url="https://example.test",
+        min_request_interval=0,
+        response_cache=cache,
+    )
+    second = KisRestClient(
+        KisCredentials("key", "secret"),
+        session=FakeSession(),  # type: ignore[arg-type]
+        base_url="https://example.test",
+        min_request_interval=0,
+        response_cache=cache,
+    )
+
+    assert first.fetch_listed_shares() == {"005930": 5_919_638_922}
+    assert second.fetch_listed_shares() == {"005930": 5_919_638_922}
+    assert calls == [1]
+
+
+def test_daily_static_quote_values_are_stable_and_persisted(tmp_path: Path) -> None:
+    cache = ResponseCache(tmp_path / "cache.db")
+    trading_date = date(2026, 8, 11)
+    updated_at = datetime(2026, 8, 11, 8, 1)
+    initial = RestQuote(
+        NXT,
+        "005930",
+        "삼성전자",
+        70_100,
+        70_000,
+        10,
+        701_000,
+        updated_at,
+        upper_limit_price=91_000,
+        lower_limit_price=49_000,
+    )
+    changed = RestQuote(
+        NXT,
+        "005930",
+        "삼성전자",
+        70_500,
+        69_000,
+        20,
+        1_410_000,
+        updated_at,
+        upper_limit_price=90_000,
+        lower_limit_price=48_000,
+    )
+    first_collector = KisRestUniverseCollector(
+        object(),  # type: ignore[arg-type]
+        response_cache=cache,
+    )
+
+    assert first_collector._cache_daily_static_quotes(
+        [initial], trading_date
+    )[0].reference_price == 70_000
+    stabilized = first_collector._cache_daily_static_quotes([changed], trading_date)[0]
+    assert stabilized.current_price == 70_500
+    assert stabilized.reference_price == 70_000
+    assert stabilized.upper_limit_price == 91_000
+    assert stabilized.lower_limit_price == 49_000
+
+    restarted_collector = KisRestUniverseCollector(
+        object(),  # type: ignore[arg-type]
+        response_cache=cache,
+    )
+    restarted = restarted_collector._cache_daily_static_quotes(
+        [changed], trading_date
+    )[0]
+    assert restarted.reference_price == 70_000
+    assert restarted.upper_limit_price == 91_000
+    assert restarted.lower_limit_price == 49_000
 
 
 def test_rest_index_quotes_include_value_change_and_market_totals() -> None:
