@@ -236,8 +236,7 @@ def test_unavailability_frame_prefers_matched_kind_original() -> None:
     frame = nxt_unavailability_events_to_frame([event])
 
     assert frame.iloc[0]["KIND 공시"] == (
-        '<a href="https://kind.example/viewer" target="_blank" '
-        'rel="noopener noreferrer">투자경고종목지정</a>'
+        "https://kind.example/viewer#kind-title=투자경고종목지정"
     )
     assert not {
         "데이터근거",
