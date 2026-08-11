@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from html import escape
 from typing import Iterable, Mapping, Sequence
 
 import pandas as pd
@@ -347,6 +348,19 @@ def nxt_unavailability_events_to_frame(
 ) -> pd.DataFrame:
     """거래불가 현황 화면에 필요한 사용자 표시 칼럼만 반환합니다."""
 
+    def kind_disclosure_link(title: str, viewer_url: str) -> str:
+        display_title = str(title or "").strip()
+        if not display_title:
+            return ""
+        safe_title = escape(display_title)
+        safe_url = escape(str(viewer_url or "").strip(), quote=True)
+        if not safe_url:
+            return safe_title
+        return (
+            f'<a href="{safe_url}" target="_blank" '
+            f'rel="noopener noreferrer">{safe_title}</a>'
+        )
+
     return pd.DataFrame.from_records(
         [
             {
@@ -357,8 +371,10 @@ def nxt_unavailability_events_to_frame(
                 "구분": item.event_type,
                 "거래가능시장": item.tradable_market,
                 "거래불가사유": item.unavailable_reason,
-                "판단근거": item.basis,
-                "KIND 공시": item.kind_viewer_url or "",
+                "KIND 공시": kind_disclosure_link(
+                    item.kind_title or "",
+                    item.kind_viewer_url or "",
+                ),
             }
             for item in events
         ]
