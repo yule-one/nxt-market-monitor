@@ -3,12 +3,28 @@ from zoneinfo import ZoneInfo
 
 from src.nxt_api_control import (
     NxtMinuteLookupGate,
+    is_nxt_api_collection_window,
     is_nxt_morning_break,
     seconds_until_nxt_morning_resume,
 )
 
 
 KST = ZoneInfo("Asia/Seoul")
+
+
+def test_nxt_api_collection_window_uses_half_open_window() -> None:
+    assert not is_nxt_api_collection_window(
+        datetime(2026, 8, 10, 7, 59, 59, tzinfo=KST)
+    )
+    assert is_nxt_api_collection_window(
+        datetime(2026, 8, 10, 8, 0, tzinfo=KST)
+    )
+    assert is_nxt_api_collection_window(
+        datetime(2026, 8, 10, 20, 4, 59, tzinfo=KST)
+    )
+    assert not is_nxt_api_collection_window(
+        datetime(2026, 8, 10, 20, 5, tzinfo=KST)
+    )
 
 
 def test_nxt_morning_break_uses_half_open_window() -> None:

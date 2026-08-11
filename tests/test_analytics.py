@@ -235,9 +235,8 @@ def test_unavailability_frame_prefers_matched_kind_original() -> None:
 
     frame = nxt_unavailability_events_to_frame([event])
 
-    assert frame.iloc[0]["원문구분"] == "KIND"
-    assert frame.iloc[0]["KIND 공시"] == "투자경고종목지정"
-    assert frame.iloc[0]["원문"] == "https://kind.example/viewer"
+    assert frame.iloc[0]["KIND 공시"] == "https://kind.example/viewer"
+    assert not {"데이터근거", "원문구분", "원문"}.intersection(frame.columns)
 
 
 def test_unavailability_frame_leaves_unmatched_original_blank() -> None:
@@ -257,9 +256,8 @@ def test_unavailability_frame_leaves_unmatched_original_blank() -> None:
 
     frame = nxt_unavailability_events_to_frame([event])
 
-    assert frame.iloc[0]["원문구분"] == ""
     assert frame.iloc[0]["KIND 공시"] == ""
-    assert frame.iloc[0]["원문"] == ""
+    assert not {"데이터근거", "원문구분", "원문"}.intersection(frame.columns)
 
 
 def test_preferred_share_notice_is_not_joined_to_common_share() -> None:
