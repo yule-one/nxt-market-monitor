@@ -92,6 +92,7 @@ HISTORICAL_STORE_RUNTIME_VERSION = 15
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 5
 KIS_UNIVERSE_RUNTIME_VERSION = 1
+AUTH_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
 KIS_MINUTE_REQUEST_INTERVAL_SECONDS = 1.0
 NXT_LIMIT_PROXIMITY_TICKS = 3
@@ -385,8 +386,27 @@ def get_response_cache() -> ResponseCache:
 
 
 @st.cache_resource
+def _get_auth_store(database_url: str, runtime_version: int) -> AuthStore:
+    # AuthStore의 스키마나 공개 메서드가 바뀌면 이전 배포에서 남은 리소스 캐시를
+    # 재사용하지 않도록 런타임 버전을 캐시 키에 포함합니다.
+    _ = runtime_version
+    return AuthStore(database_url=database_url or None)
+
+
 def get_auth_store() -> AuthStore:
-    return AuthStore(database_url=_secret_value("AUTH_DATABASE_URL") or None)
+    database_url = _secret_value("AUTH_DATABASE_URL")
+    store = _get_auth_store(database_url, AUTH_STORE_RUNTIME_VERSION)
+    required_methods = (
+        "authenticate_with_status",
+        "request_signup",
+        "review_signup_request",
+    )
+    if not all(hasattr(store, method_name) for method_name in required_methods):
+        # Streamlit이 코드 배포 사이에 오래된 resource 객체를 유지한 경우에도
+        # 즉시 새 AuthStore를 만들고 자동 스키마 보강을 다시 실행합니다.
+        _get_auth_store.clear()
+        store = _get_auth_store(database_url, AUTH_STORE_RUNTIME_VERSION)
+    return store
 
 
 @st.cache_resource
