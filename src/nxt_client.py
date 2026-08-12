@@ -2,14 +2,24 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
+import logging
 import re
+import threading
+import time
 from typing import Iterable
+
+import requests
 
 from src.cache import ResponseCache
 from src.config import NXT_CHANGE_URL, NXT_TRADING_STATUS_URL
 from src.http import ResilientSession
 from src.models import NxtChange, NxtTradingStatus
 from src.nxt_price_limits import calculate_stock_price_limits
+
+
+LOGGER = logging.getLogger(__name__)
+NXT_TRADING_STATUS_CACHE_SOURCE = "nxt_trading_status_v4"
+NXT_TRADING_STATUS_FAILURE_BACKOFF_SECONDS = 60.0
 
 
 def _date_chunks(start_date: date, end_date: date, days: int = 90) -> Iterable[tuple[date, date]]:
@@ -44,9 +54,27 @@ def _decimal(raw: object) -> float:
 
 
 class NxtClient:
+    _trading_status_lock = threading.Lock()
+    _trading_status_retry_after: dict[str, float] = {}
+
     def __init__(self, cache: ResponseCache | None = None) -> None:
         self.cache = cache or ResponseCache()
         self.ssl_fallback_used = False
+        self.trading_status_fallback_warning = ""
+
+    def _cached_trading_status(
+        self,
+        cache_key: str,
+        max_age: timedelta | None,
+    ) -> list[NxtTradingStatus] | None:
+        cached = self.cache.get(
+            NXT_TRADING_STATUS_CACHE_SOURCE,
+            cache_key,
+            max_age,
+        )
+        if cached is None:
+            return None
+        return [NxtTradingStatus.from_dict(item) for item in cached]
 
     def fetch_changes(
         self,
@@ -89,55 +117,106 @@ class NxtClient:
         force_refresh: bool = False,
     ) -> list[NxtTradingStatus]:
         cache_key = status_date.strftime("%Y%m%d")
+        self.trading_status_fallback_warning = ""
         # 확정된 과거 일별 데이터는 SQLite에 영구 보관해 재호출하지 않습니다.
         # 당일 값만 장중 변경을 반영하기 위해 짧은 만료시간을 둡니다.
         max_age = timedelta(minutes=15) if status_date >= date.today() else None
-        cached = (
+        cached_rows = (
             None
             if force_refresh
-            else self.cache.get("nxt_trading_status_v4", cache_key, max_age)
+            else self._cached_trading_status(cache_key, max_age)
         )
-        if cached is not None:
-            return [NxtTradingStatus.from_dict(item) for item in cached]
+        if cached_rows is not None:
+            return cached_rows
 
-        session = ResilientSession(referer="https://www.nextrade.co.kr/")
-        payload = {
-            "pageIndex": "1",
-            "pageUnit": "5000",
-            "scAggDd": cache_key,
-            "scMktId": "",
-            "searchKeyword": "",
-        }
-        response = session.post(
-            NXT_TRADING_STATUS_URL,
-            data=payload,
-            headers={"X-Requested-With": "XMLHttpRequest"},
-        )
-        self.ssl_fallback_used = self.ssl_fallback_used or session.ssl_fallback_used
-        raw = response.json()
-        pages = max(1, int(raw.get("total") or 1))
-        rows = list(raw.get("brdinfoTimeList") or [])
-        for page in range(2, pages + 1):
-            payload["pageIndex"] = str(page)
-            page_response = session.post(
-                NXT_TRADING_STATUS_URL,
-                data=payload,
-                headers={"X-Requested-With": "XMLHttpRequest"},
+        # 여러 Streamlit 세션이 동시에 같은 날짜의 캐시 미스를 만나도 실제
+        # NXT 조회는 한 세션만 수행하고, 나머지는 갱신된 공유 캐시를 사용합니다.
+        with self._trading_status_lock:
+            cached_rows = (
+                None
+                if force_refresh
+                else self._cached_trading_status(cache_key, max_age)
             )
-            rows.extend(page_response.json().get("brdinfoTimeList") or [])
-        self.ssl_fallback_used = self.ssl_fallback_used or session.ssl_fallback_used
+            if cached_rows is not None:
+                return cached_rows
 
-        parsed = [self._parse_trading_status(item) for item in rows]
-        unique = {
-            item.stock_code: item for item in parsed if item is not None
-        }
-        result = sorted(unique.values(), key=lambda item: (item.market, item.stock_code))
-        self.cache.set(
-            "nxt_trading_status_v4",
-            cache_key,
-            [item.to_dict() for item in result],
-        )
-        return result
+            retry_after = self._trading_status_retry_after.get(cache_key, 0.0)
+            if not force_refresh and time.monotonic() < retry_after:
+                stale_rows = self._cached_trading_status(cache_key, None)
+                if stale_rows is not None:
+                    self.trading_status_fallback_warning = (
+                        "NXT 공식 사이트 연결 재시도 대기 중이라 같은 날짜의 "
+                        "최근 저장 종목 현황을 사용합니다."
+                    )
+                    return stale_rows
+                raise requests.ConnectionError(
+                    "NXT trading-status request is temporarily paused after a connection failure."
+                )
+
+            session = ResilientSession(referer="https://www.nextrade.co.kr/")
+            payload = {
+                "pageIndex": "1",
+                "pageUnit": "5000",
+                "scAggDd": cache_key,
+                "scMktId": "",
+                "searchKeyword": "",
+            }
+            try:
+                response = session.post(
+                    NXT_TRADING_STATUS_URL,
+                    data=payload,
+                    headers={"X-Requested-With": "XMLHttpRequest"},
+                )
+                self.ssl_fallback_used = (
+                    self.ssl_fallback_used or session.ssl_fallback_used
+                )
+                raw = response.json()
+                pages = max(1, int(raw.get("total") or 1))
+                rows = list(raw.get("brdinfoTimeList") or [])
+                for page in range(2, pages + 1):
+                    payload["pageIndex"] = str(page)
+                    page_response = session.post(
+                        NXT_TRADING_STATUS_URL,
+                        data=payload,
+                        headers={"X-Requested-With": "XMLHttpRequest"},
+                    )
+                    rows.extend(page_response.json().get("brdinfoTimeList") or [])
+                self.ssl_fallback_used = (
+                    self.ssl_fallback_used or session.ssl_fallback_used
+                )
+            except requests.RequestException:
+                self._trading_status_retry_after[cache_key] = (
+                    time.monotonic() + NXT_TRADING_STATUS_FAILURE_BACKOFF_SECONDS
+                )
+                stale_rows = self._cached_trading_status(cache_key, None)
+                if stale_rows is not None:
+                    self.trading_status_fallback_warning = (
+                        "NXT 공식 사이트 연결에 실패해 같은 날짜의 최근 저장 "
+                        "종목 현황을 사용합니다."
+                    )
+                    LOGGER.warning(
+                        "NXT trading-status request failed; using stale cache for %s",
+                        cache_key,
+                        exc_info=True,
+                    )
+                    return stale_rows
+                raise
+
+            self._trading_status_retry_after.pop(cache_key, None)
+            parsed = [self._parse_trading_status(item) for item in rows]
+            unique = {
+                item.stock_code: item for item in parsed if item is not None
+            }
+            result = sorted(
+                unique.values(),
+                key=lambda item: (item.market, item.stock_code),
+            )
+            self.cache.set(
+                NXT_TRADING_STATUS_CACHE_SOURCE,
+                cache_key,
+                [item.to_dict() for item in result],
+            )
+            return result
 
     def fetch_trading_status_range(
         self,

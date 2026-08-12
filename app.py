@@ -10,6 +10,7 @@ from html import escape
 
 import pandas as pd
 import plotly.express as px
+from requests import RequestException
 import streamlit as st
 
 from src.analytics import (
@@ -392,6 +393,7 @@ def get_historical_market_store() -> HistoricalMarketStore:
             "list_nxt_eligibility_summaries",
             "list_nxt_unavailability_events",
             "list_nxt_index_member_counts",
+            "load_latest_nxt_statuses",
         )
     ):
         _get_historical_market_store.clear()
@@ -865,13 +867,37 @@ def _nxt_universe_for_date(status_date: date) -> tuple[
     dict[str, str],
     dict[str, str],
     list[NxtTradingStatus],
+    str,
 ]:
+    today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    if status_date < today:
+        stored_statuses = get_historical_market_store().load_nxt_statuses(status_date)
+        if stored_statuses:
+            symbols, markets, tradable_markets, unavailable_reasons = (
+                _universe_metadata(stored_statuses)
+            )
+            return (
+                symbols,
+                markets,
+                tradable_markets,
+                unavailable_reasons,
+                stored_statuses,
+                "",
+            )
+
     client = NxtClient(get_response_cache())
     statuses = client.fetch_trading_status(status_date)
     symbols, markets, tradable_markets, unavailable_reasons = _universe_metadata(
         statuses
     )
-    return symbols, markets, tradable_markets, unavailable_reasons, statuses
+    return (
+        symbols,
+        markets,
+        tradable_markets,
+        unavailable_reasons,
+        statuses,
+        client.trading_status_fallback_warning,
+    )
 
 
 def _universe_metadata(
@@ -905,26 +931,98 @@ def _latest_nxt_universe() -> tuple[
     dict[str, str],
     dict[str, str],
     dict[str, str],
+    str,
 ]:
     today = pd.Timestamp.now(tz="Asia/Seoul").date()
-    for days_ago in range(8):
-        status_date = today - timedelta(days=days_ago)
+    request_error: RequestException | None = None
+    try:
         (
             symbols,
             markets,
             tradable_markets,
             unavailable_reasons,
             _statuses,
-        ) = _nxt_universe_for_date(status_date)
+            warning,
+        ) = _nxt_universe_for_date(today)
         if symbols:
             return (
-                status_date,
+                today,
                 symbols,
                 markets,
                 tradable_markets,
                 unavailable_reasons,
+                warning,
             )
-    return None, [], {}, {}, {}
+    except RequestException as exc:
+        request_error = exc
+        LOGGER.warning(
+            "NXT current-universe request failed; trying stored history",
+            exc_info=True,
+        )
+
+    stored_date, stored_statuses = (
+        get_historical_market_store().load_latest_nxt_statuses(today)
+    )
+    if stored_date is not None and stored_statuses:
+        symbols, markets, tradable_markets, unavailable_reasons = (
+            _universe_metadata(stored_statuses)
+        )
+        warning = ""
+        if request_error is not None:
+            warning = (
+                "NXT 공식 사이트 연결에 실패해 "
+                f"{stored_date:%Y-%m-%d}에 저장된 종목 목록을 사용합니다. "
+                "장중 가격은 계속 갱신되지만 거래가능시장과 거래불가사유는 "
+                "저장일 기준일 수 있습니다."
+            )
+        return (
+            stored_date,
+            symbols,
+            markets,
+            tradable_markets,
+            unavailable_reasons,
+            warning,
+        )
+
+    # 새 로컬 환경처럼 DB가 아직 비어 있고 오늘 응답만 빈 경우에는 기존과
+    # 같이 최근 7일을 확인합니다. 연결 실패가 확인된 경우에는 반복 호출하지 않습니다.
+    if request_error is None:
+        for days_ago in range(1, 8):
+            status_date = today - timedelta(days=days_ago)
+            try:
+                (
+                    symbols,
+                    markets,
+                    tradable_markets,
+                    unavailable_reasons,
+                    _statuses,
+                    warning,
+                ) = _nxt_universe_for_date(status_date)
+            except RequestException as exc:
+                LOGGER.warning(
+                    "NXT fallback-universe request failed for %s",
+                    status_date,
+                    exc_info=True,
+                )
+                request_error = exc
+                break
+            if symbols:
+                return (
+                    status_date,
+                    symbols,
+                    markets,
+                    tradable_markets,
+                    unavailable_reasons,
+                    warning,
+                )
+
+    warning = (
+        "NXT 공식 사이트에 연결할 수 없고 저장된 종목 목록도 없습니다. "
+        "잠시 후 다시 시도해 주세요."
+        if request_error is not None
+        else ""
+    )
+    return None, [], {}, {}, {}, warning
 
 
 def _render_universe_counts(
@@ -1572,22 +1670,29 @@ def rest_universe_page() -> None:
             markets,
             tradable_markets,
             unavailable_reasons,
+            universe_warning,
         ) = _latest_nxt_universe()
     if universe_date is None or not symbols:
-        st.error("최근 NXT 전체 종목 목록을 불러오지 못했습니다.")
+        st.error(
+            universe_warning or "최근 NXT 전체 종목 목록을 불러오지 못했습니다."
+        )
         return
 
     today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    live_fallback = bool(universe_warning) and is_nxt_api_collection_window()
+    default_date = today if live_fallback else universe_date
     date_columns = st.columns([1, 4])
     selected_date = date_columns[0].date_input(
         "조회일자",
-        value=universe_date,
+        value=default_date,
         min_value=NXT_LAUNCH_DATE,
         max_value=today,
         format="YYYY-MM-DD",
         key="nxt_dashboard_date",
     )
-    if selected_date != today or universe_date != today:
+    if universe_warning:
+        st.warning(universe_warning)
+    if selected_date != today:
         history_store = get_historical_market_store()
         fx_quote = history_store.load_fx_quote(selected_date)
         stored_snapshot = history_store.load_historical_snapshot(selected_date)
@@ -1600,16 +1705,29 @@ def rest_universe_page() -> None:
                 historical_unavailable_reasons,
             ) = _universe_metadata(historical_statuses)
         else:
-            with st.spinner(
-                f"{selected_date:%Y-%m-%d} 데이터를 최초 1회 DB에 저장하고 있습니다..."
-            ):
-                (
-                    historical_symbols,
-                    historical_markets,
-                    historical_tradable_markets,
-                    historical_unavailable_reasons,
-                    historical_statuses,
-                ) = _nxt_universe_for_date(selected_date)
+            try:
+                with st.spinner(
+                    f"{selected_date:%Y-%m-%d} 데이터를 최초 1회 DB에 저장하고 있습니다..."
+                ):
+                    (
+                        historical_symbols,
+                        historical_markets,
+                        historical_tradable_markets,
+                        historical_unavailable_reasons,
+                        historical_statuses,
+                        _historical_warning,
+                    ) = _nxt_universe_for_date(selected_date)
+            except RequestException:
+                LOGGER.warning(
+                    "NXT historical-universe request failed for %s",
+                    selected_date,
+                    exc_info=True,
+                )
+                st.warning(
+                    "선택한 일자의 NXT 데이터가 DB에 없고 공식 사이트에도 "
+                    "연결할 수 없습니다. 잠시 후 다시 시도해 주세요."
+                )
+                return
             if not historical_symbols:
                 st.warning("선택한 일자에는 NXT 정규시장 데이터가 없습니다.")
                 return
@@ -2815,23 +2933,20 @@ def nxt_price_limits_page() -> None:
 
     with st.spinner("당일 NXT 종목 목록을 불러오고 있습니다..."):
         (
+            _universe_date,
             symbols,
             markets,
             tradable_markets,
             _unavailable_reasons,
-            _current_statuses,
-        ) = _nxt_universe_for_date(today)
-        if not symbols:
-            (
-                _universe_date,
-                symbols,
-                markets,
-                tradable_markets,
-                _unavailable_reasons,
-            ) = _latest_nxt_universe()
+            universe_warning,
+        ) = _latest_nxt_universe()
     if not symbols:
-        st.error("당일 조회에 사용할 NXT 종목 목록이 없습니다.")
+        st.error(
+            universe_warning or "당일 조회에 사용할 NXT 종목 목록이 없습니다."
+        )
         return
+    if universe_warning:
+        st.warning(universe_warning)
     app_key = _secret_value("KIS_APP_KEY")
     app_secret = _secret_value("KIS_APP_SECRET")
     if not app_key or not app_secret:
@@ -3103,23 +3218,20 @@ def nxt_price_limit_proximity_page() -> None:
 
     with st.spinner("당일 NXT 종목 목록을 불러오고 있습니다..."):
         (
+            _universe_date,
             symbols,
             markets,
             tradable_markets,
             _unavailable_reasons,
-            _current_statuses,
-        ) = _nxt_universe_for_date(today)
-        if not symbols:
-            (
-                _universe_date,
-                symbols,
-                markets,
-                tradable_markets,
-                _unavailable_reasons,
-            ) = _latest_nxt_universe()
+            universe_warning,
+        ) = _latest_nxt_universe()
     if not symbols:
-        st.error("당일 조회에 사용할 NXT 종목 목록이 없습니다.")
+        st.error(
+            universe_warning or "당일 조회에 사용할 NXT 종목 목록이 없습니다."
+        )
         return
+    if universe_warning:
+        st.warning(universe_warning)
     app_key = _secret_value("KIS_APP_KEY")
     app_secret = _secret_value("KIS_APP_SECRET")
     if not app_key or not app_secret:

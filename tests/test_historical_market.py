@@ -204,6 +204,30 @@ def test_historical_store_builds_reclassified_daily_eligibility(tmp_path: Path) 
     assert reason_counts[("편출", "정기변경")] == 1
 
 
+def test_historical_store_loads_latest_nxt_statuses_on_or_before(
+    tmp_path: Path,
+) -> None:
+    store = HistoricalMarketStore(tmp_path / "history.db")
+    first_date = date(2026, 8, 5)
+    latest_date = date(2026, 8, 7)
+    first_statuses, _ = _snapshot(first_date)
+    latest_statuses, _ = _snapshot(latest_date)
+    store.save_nxt_statuses(first_date, first_statuses)
+    store.save_nxt_statuses(latest_date, latest_statuses)
+
+    resolved_date, statuses = store.load_latest_nxt_statuses(date(2026, 8, 8))
+
+    assert resolved_date == latest_date
+    assert {item.stock_code for item in statuses} == {"000660", "005930"}
+    assert all(item.status_date == latest_date for item in statuses)
+
+    missing_date, missing_statuses = store.load_latest_nxt_statuses(
+        date(2026, 8, 4)
+    )
+    assert missing_date is None
+    assert missing_statuses == []
+
+
 def test_historical_store_materializes_unavailability_events(tmp_path: Path) -> None:
     store = HistoricalMarketStore(tmp_path / "history.db")
     first_date = date(2026, 8, 5)
