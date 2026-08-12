@@ -2627,6 +2627,36 @@ class HistoricalMarketStore:
             ).fetchall()
         return [self._nxt_status_from_row(trading_date, row) for row in rows]
 
+    def load_latest_nxt_statuses(
+        self,
+        on_or_before: date,
+    ) -> tuple[date | None, list[NxtTradingStatus]]:
+        """기준일 이하에서 가장 최근에 저장된 NXT 종목 현황을 반환합니다."""
+
+        with self._lock, self._connect() as connection:
+            date_row = connection.execute(
+                """
+                SELECT MAX(trade_date) AS trade_date
+                FROM nxt_daily_quotes
+                WHERE trade_date <= ?
+                """,
+                (on_or_before.isoformat(),),
+            ).fetchone()
+            if date_row is None or not date_row["trade_date"]:
+                return None, []
+            trading_date = date.fromisoformat(str(date_row["trade_date"]))
+            rows = connection.execute(
+                """
+                SELECT * FROM nxt_daily_quotes
+                WHERE trade_date = ?
+                ORDER BY market, stock_code
+                """,
+                (trading_date.isoformat(),),
+            ).fetchall()
+        return trading_date, [
+            self._nxt_status_from_row(trading_date, row) for row in rows
+        ]
+
     def list_nxt_eligibility_summaries(
         self,
         start_date: date,

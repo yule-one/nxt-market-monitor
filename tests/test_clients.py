@@ -1,5 +1,8 @@
 from datetime import date
 
+import requests
+import pytest
+
 from src.kind_client import KindClient, normalize_kind_code
 from src.nxt_client import NxtClient, normalize_stock_code
 
@@ -15,6 +18,19 @@ class TrackingCache:
 
     def set(self, _source: str, _key: str, _payload: object) -> None:
         raise AssertionError("cached payload should be reused")
+
+
+class StaleTrackingCache:
+    def __init__(self, payload: object | None) -> None:
+        self.payload = payload
+        self.max_ages: list[object] = []
+
+    def get(self, _source: str, _key: str, max_age: object = None) -> object:
+        self.max_ages.append(max_age)
+        return self.payload if max_age is None else None
+
+    def set(self, _source: str, _key: str, _payload: object) -> None:
+        raise AssertionError("failed response must not overwrite the stale cache")
 
 
 def test_normalize_stock_codes() -> None:
@@ -118,6 +134,63 @@ def test_past_nxt_trading_status_is_reused_without_expiration() -> None:
 
     assert cache.max_age is None
     assert rows[0].stock_code == "005930"
+
+
+def test_current_nxt_trading_status_uses_stale_cache_on_connection_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_date = date.today()
+    cache_key = status_date.strftime("%Y%m%d")
+    cached_row = {
+        "status_date": status_date.isoformat(),
+        "stock_code": "005930",
+        "stock_name": "삼성전자",
+        "market": "KOSPI",
+        "tradable_market": "NXT",
+        "unavailable_reason": "",
+    }
+    cache = StaleTrackingCache([cached_row])
+    NxtClient._trading_status_retry_after.pop(cache_key, None)
+
+    def fail_post(*_args: object, **_kwargs: object) -> object:
+        raise requests.ConnectionError("temporary failure")
+
+    monkeypatch.setattr("src.nxt_client.ResilientSession.post", fail_post)
+    client = NxtClient(cache)  # type: ignore[arg-type]
+    try:
+        rows = client.fetch_trading_status(status_date)
+    finally:
+        NxtClient._trading_status_retry_after.pop(cache_key, None)
+
+    assert rows[0].stock_code == "005930"
+    assert cache.max_ages[-1] is None
+    assert "최근 저장" in client.trading_status_fallback_warning
+
+
+def test_current_nxt_trading_status_connection_failure_has_shared_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status_date = date.today()
+    cache_key = status_date.strftime("%Y%m%d")
+    cache = StaleTrackingCache(None)
+    call_count = 0
+    NxtClient._trading_status_retry_after.pop(cache_key, None)
+
+    def fail_post(*_args: object, **_kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        raise requests.ConnectionError("temporary failure")
+
+    monkeypatch.setattr("src.nxt_client.ResilientSession.post", fail_post)
+    try:
+        with pytest.raises(requests.ConnectionError):
+            NxtClient(cache).fetch_trading_status(status_date)  # type: ignore[arg-type]
+        with pytest.raises(requests.ConnectionError):
+            NxtClient(cache).fetch_trading_status(status_date)  # type: ignore[arg-type]
+    finally:
+        NxtClient._trading_status_retry_after.pop(cache_key, None)
+
+    assert call_count == 1
 
 
 def test_parse_investment_status_period() -> None:
