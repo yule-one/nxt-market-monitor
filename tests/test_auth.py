@@ -50,6 +50,26 @@ def test_password_policy_rejects_weak_passwords(password: str) -> None:
         hash_password(password)
 
 
+@pytest.mark.parametrize(
+    "employee_number",
+    ["12345", "1234567", "12A456", "ABCDEF", "１２３４５６"],
+)
+def test_signup_requires_six_digit_employee_number(
+    tmp_path: Path,
+    employee_number: str,
+) -> None:
+    store = make_store(tmp_path)
+    make_admin(store)
+
+    with pytest.raises(AuthError, match="숫자 6자리"):
+        store.request_signup(
+            username="invalid-employee",
+            employee_number=employee_number,
+            display_name="잘못된 사번",
+            password=STRONG_PASSWORD,
+        )
+
+
 def test_initial_admin_can_only_be_created_once(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     admin = make_admin(store)
@@ -59,6 +79,49 @@ def test_initial_admin_can_only_be_created_once(tmp_path: Path) -> None:
     assert store.authenticate("ADMIN", STRONG_PASSWORD) is not None
     with pytest.raises(AuthError, match="이미 설정"):
         make_admin(store)
+
+
+def test_persistent_session_restores_user_and_stores_only_token_hash(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin = make_admin(store)
+
+    token, expires_at = store.create_persistent_session(user_id=admin.id)
+    restored = store.authenticate_persistent_session(token)
+
+    assert restored is not None and restored.id == admin.id
+    assert expires_at > store._now()
+    assert store.path is not None
+    with sqlite3.connect(store.path) as connection:
+        stored_token_hash = connection.execute(
+            "SELECT token_hash FROM auth_sessions"
+        ).fetchone()[0]
+    assert stored_token_hash != token
+    assert len(stored_token_hash) == 64
+
+    store.revoke_persistent_session(token)
+    assert store.authenticate_persistent_session(token) is None
+
+
+def test_deactivating_account_revokes_persistent_sessions(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    admin = make_admin(store)
+    user = store.create_user(
+        actor_user_id=admin.id,
+        username="session-user",
+        display_name="세션 사용자",
+        temporary_password=STRONG_PASSWORD,
+    )
+    token, _ = store.create_persistent_session(user_id=user.id)
+
+    store.set_active(
+        actor_user_id=admin.id,
+        target_user_id=user.id,
+        is_active=False,
+    )
+
+    assert store.authenticate_persistent_session(token) is None
 
 
 def test_admin_issues_account_and_user_must_change_password(tmp_path: Path) -> None:
@@ -92,13 +155,13 @@ def test_signup_requires_admin_approval_before_login(tmp_path: Path) -> None:
     admin = make_admin(store)
     applicant = store.request_signup(
         username="applicant01",
-        employee_number="E00123",
+        employee_number="100123",
         display_name="신청자",
         password=STRONG_PASSWORD,
     )
 
     assert applicant.approval_status == "pending"
-    assert applicant.employee_number == "E00123"
+    assert applicant.employee_number == "100123"
     assert not applicant.is_active
     pending_login = store.authenticate_with_status(
         applicant.username,
@@ -129,7 +192,7 @@ def test_rejected_signup_cannot_login_and_keeps_reason(tmp_path: Path) -> None:
     admin = make_admin(store)
     applicant = store.request_signup(
         username="applicant02",
-        employee_number="e00124",
+        employee_number="100124",
         display_name="반려 대상",
         password=STRONG_PASSWORD,
     )
@@ -156,7 +219,7 @@ def test_admin_can_delete_only_rejected_signup_and_reuse_identifiers(
     admin = make_admin(store)
     applicant = store.request_signup(
         username="applicant-delete",
-        employee_number="E00999",
+        employee_number="100999",
         display_name="삭제 대상",
         password=STRONG_PASSWORD,
     )
@@ -181,7 +244,7 @@ def test_admin_can_delete_only_rejected_signup_and_reuse_identifiers(
     assert store.get_user(applicant.id) is None
     recreated = store.request_signup(
         username="applicant-delete",
-        employee_number="e00999",
+        employee_number="100999",
         display_name="재신청자",
         password=NEW_PASSWORD,
     )
@@ -204,7 +267,7 @@ def test_non_admin_cannot_delete_rejected_signup(tmp_path: Path) -> None:
     )
     applicant = store.request_signup(
         username="rejected-user",
-        employee_number="E00888",
+        employee_number="100888",
         display_name="반려 사용자",
         password=STRONG_PASSWORD,
     )
@@ -226,7 +289,7 @@ def test_signup_rejects_duplicate_username_and_employee_number(tmp_path: Path) -
     make_admin(store)
     store.request_signup(
         username="applicant03",
-        employee_number="E00125",
+        employee_number="100125",
         display_name="첫 신청자",
         password=STRONG_PASSWORD,
     )
@@ -234,14 +297,14 @@ def test_signup_rejects_duplicate_username_and_employee_number(tmp_path: Path) -
     with pytest.raises(AuthError, match="아이디"):
         store.request_signup(
             username="applicant03",
-            employee_number="E00126",
+            employee_number="100126",
             display_name="중복 아이디",
             password=STRONG_PASSWORD,
         )
     with pytest.raises(AuthError, match="사번"):
         store.request_signup(
             username="applicant04",
-            employee_number="e00125",
+            employee_number="100125",
             display_name="중복 사번",
             password=STRONG_PASSWORD,
         )
