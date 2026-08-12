@@ -605,7 +605,7 @@ def _current_auth_user() -> AuthUser | None:
         _clear_auth_session()
         return None
     user = get_auth_store().get_user(user_id)
-    if user is None or not user.is_active:
+    if user is None or not user.is_active or not user.is_approved:
         _clear_auth_session()
         return None
     return user
@@ -624,8 +624,8 @@ def _render_initial_admin_setup() -> None:
         unsafe_allow_html=True,
     )
     st.info(
-        "최초 한 번만 관리자 계정을 생성합니다. 이후에는 관리자가 사용자 계정을 직접 발급하며, "
-        "공개 회원가입은 제공하지 않습니다."
+        "최초 한 번만 관리자 계정을 생성합니다. 이후 사용자는 직접 회원가입을 신청하고 "
+        "관리자가 사번과 이름을 확인해 승인할 수 있습니다."
     )
     setup_token = _secret_value("AUTH_SETUP_TOKEN")
     if not setup_token:
@@ -689,31 +689,96 @@ def _render_login_page() -> None:
         '<div class="nextrade-dashboard-title">NEXTRADE 시장운영 DASHBOARD</div>',
         unsafe_allow_html=True,
     )
-    st.subheader("로그인")
-    with st.form("login_form", clear_on_submit=False):
-        username = st.text_input("아이디", autocomplete="username")
-        password = st.text_input(
-            "비밀번호",
-            type="password",
-            autocomplete="current-password",
+    login_tab, signup_tab = st.tabs(["로그인", "회원가입 신청"])
+    with login_tab:
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("아이디", autocomplete="username")
+            password = st.text_input(
+                "비밀번호",
+                type="password",
+                autocomplete="current-password",
+            )
+            login_submitted = st.form_submit_button(
+                "로그인",
+                type="primary",
+                use_container_width=True,
+            )
+        st.caption(
+            "회원가입 신청은 관리자 승인 후 사용할 수 있습니다. 로그인에 5회 실패하면 "
+            "계정이 15분간 잠깁니다."
         )
-        submitted = st.form_submit_button(
-            "로그인",
-            type="primary",
-            use_container_width=True,
+        if login_submitted:
+            result = get_auth_store().authenticate_with_status(username, password)
+            if result.status == "pending":
+                st.info("회원가입 신청이 접수되어 관리자 승인 대기 중입니다.")
+            elif result.status == "rejected":
+                message = "회원가입 신청이 반려되었습니다. 관리자에게 문의하세요."
+                if result.rejection_reason:
+                    message += f"\n\n반려 사유: {result.rejection_reason}"
+                st.error(message)
+            elif result.status == "locked":
+                st.error("로그인 실패가 누적되어 계정이 잠겼습니다. 15분 후 다시 시도하세요.")
+            elif result.status == "inactive":
+                st.error("비활성화된 계정입니다. 관리자에게 문의하세요.")
+            elif result.user is None:
+                st.error("로그인하지 못했습니다. 아이디와 비밀번호를 확인하세요.")
+            else:
+                st.session_state[AUTH_SESSION_USER_ID_KEY] = result.user.id
+                st.rerun()
+
+    with signup_tab:
+        st.caption("아이디·비밀번호·사번·이름을 입력하면 관리자 승인 대기 상태로 접수됩니다.")
+        with st.form("signup_request_form", clear_on_submit=True):
+            signup_username = st.text_input(
+                "아이디",
+                help="영문 소문자·숫자·마침표·밑줄·하이픈 3~32자",
+                key="signup_username",
+            )
+            signup_employee_number = st.text_input(
+                "사번",
+                help="영문자·숫자·밑줄·하이픈 2~30자",
+                key="signup_employee_number",
+            )
+            signup_display_name = st.text_input("이름", key="signup_display_name")
+            signup_password = st.text_input(
+                "비밀번호",
+                type="password",
+                autocomplete="new-password",
+                help="10자 이상이며 영문자와 숫자를 각각 하나 이상 포함해야 합니다.",
+                key="signup_password",
+            )
+            signup_password_confirm = st.text_input(
+                "비밀번호 확인",
+                type="password",
+                autocomplete="new-password",
+                key="signup_password_confirm",
+            )
+            signup_submitted = st.form_submit_button(
+                "회원가입 신청",
+                type="primary",
+                use_container_width=True,
+            )
+        st.caption(
+            "사번과 이름은 가입 승인 및 계정 관리 목적으로만 인증 DB에 저장됩니다."
         )
-    st.caption(
-        "회원가입 기능은 없습니다. 계정 발급 또는 비밀번호 초기화는 관리자에게 요청하세요. "
-        "로그인에 5회 실패하면 계정이 15분간 잠깁니다."
-    )
-    if not submitted:
-        return
-    user = get_auth_store().authenticate(username, password)
-    if user is None:
-        st.error("로그인하지 못했습니다. 아이디·비밀번호 또는 계정 상태를 확인하세요.")
-        return
-    st.session_state[AUTH_SESSION_USER_ID_KEY] = user.id
-    st.rerun()
+        if signup_submitted:
+            if signup_password != signup_password_confirm:
+                st.error("비밀번호 확인이 일치하지 않습니다.")
+            else:
+                try:
+                    get_auth_store().request_signup(
+                        username=signup_username,
+                        employee_number=signup_employee_number,
+                        display_name=signup_display_name,
+                        password=signup_password,
+                    )
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(
+                        "회원가입 신청이 접수되었습니다. 관리자가 승인하면 입력한 "
+                        "아이디와 비밀번호로 로그인할 수 있습니다."
+                    )
 
 
 def _render_password_change_form(user: AuthUser, *, forced: bool) -> None:
@@ -782,8 +847,9 @@ def my_account_page() -> None:
         st.stop()
     st.header("내 계정")
     role_label = "관리자" if user.is_admin else "일반 사용자"
-    account_col, role_col, login_col = st.columns(3)
+    account_col, employee_col, role_col, login_col = st.columns(4)
     account_col.metric("아이디", user.username)
+    employee_col.metric("사번", user.employee_number or "-")
     role_col.metric("권한", role_label)
     login_col.metric("최근 로그인", _format_auth_time(user.last_login_at))
     st.subheader("비밀번호 변경")
@@ -798,18 +864,25 @@ def user_management_page() -> None:
     store = get_auth_store()
     st.header("사용자 관리")
     st.caption(
-        "공개 회원가입 없이 관리자가 계정을 발급합니다. 새 계정과 비밀번호 초기화 계정은 "
-        "다음 로그인 시 비밀번호를 반드시 변경해야 합니다."
+        "회원가입 신청의 사번과 이름을 확인해 승인하거나 반려할 수 있습니다. 관리자가 직접 "
+        "발급한 계정은 첫 로그인 시 임시 비밀번호를 변경해야 합니다."
     )
     st.caption(f"계정 저장소: {store.storage_label}")
     users = store.list_users()
+    pending_users = store.list_signup_requests(actor_user_id=actor.id)
     now = datetime.now(timezone.utc)
     user_rows = [
         {
             "아이디": user.username,
-            "표시 이름": user.display_name,
+            "사번": user.employee_number or "-",
+            "이름": user.display_name,
             "권한": "관리자" if user.is_admin else "일반 사용자",
-            "상태": "활성" if user.is_active else "비활성",
+            "가입 승인": {
+                "pending": "승인 대기",
+                "approved": "승인 완료",
+                "rejected": "반려",
+            }.get(user.approval_status, user.approval_status),
+            "계정 상태": "활성" if user.is_active else "비활성",
             "비밀번호 변경 필요": "예" if user.must_change_password else "아니오",
             "잠금": (
                 _format_auth_time(user.locked_until)
@@ -826,9 +899,88 @@ def user_management_page() -> None:
         use_container_width=True,
     )
 
-    create_tab, manage_tab, audit_tab = st.tabs(
-        ["계정 발급", "계정 설정", "관리 기록"]
+    approval_tab, create_tab, manage_tab, audit_tab = st.tabs(
+        [f"가입 승인 ({len(pending_users)})", "계정 발급", "계정 설정", "관리 기록"]
     )
+    with approval_tab:
+        if not pending_users:
+            st.info("승인 대기 중인 회원가입 신청이 없습니다.")
+        else:
+            pending_rows = [
+                {
+                    "신청일시": _format_auth_time(user.signup_requested_at),
+                    "아이디": user.username,
+                    "사번": user.employee_number or "-",
+                    "이름": user.display_name,
+                }
+                for user in pending_users
+            ]
+            st.dataframe(
+                pd.DataFrame(pending_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+            pending_by_id = {user.id: user for user in pending_users}
+            selected_request_id = st.selectbox(
+                "처리할 신청",
+                options=list(pending_by_id),
+                format_func=lambda user_id: (
+                    f"{pending_by_id[user_id].username} · "
+                    f"{pending_by_id[user_id].employee_number or '-'} · "
+                    f"{pending_by_id[user_id].display_name}"
+                ),
+                key="admin_selected_signup_request_id",
+            )
+            selected_request = pending_by_id[selected_request_id]
+            detail_col1, detail_col2, detail_col3 = st.columns(3)
+            detail_col1.metric("아이디", selected_request.username)
+            detail_col2.metric("사번", selected_request.employee_number or "-")
+            detail_col3.metric("이름", selected_request.display_name)
+            rejection_reason = st.text_area(
+                "반려 사유 (선택)",
+                max_chars=500,
+                key=f"signup_rejection_reason_{selected_request.id}",
+            )
+            approve_col, reject_col = st.columns(2)
+            if approve_col.button(
+                "가입 승인",
+                type="primary",
+                use_container_width=True,
+                key=f"approve_signup_{selected_request.id}",
+            ):
+                try:
+                    store.review_signup_request(
+                        actor_user_id=actor.id,
+                        target_user_id=selected_request.id,
+                        approve=True,
+                    )
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    _set_auth_flash(
+                        f"{selected_request.username} 회원가입을 승인했습니다."
+                    )
+                    st.rerun()
+            if reject_col.button(
+                "가입 반려",
+                use_container_width=True,
+                key=f"reject_signup_{selected_request.id}",
+            ):
+                try:
+                    store.review_signup_request(
+                        actor_user_id=actor.id,
+                        target_user_id=selected_request.id,
+                        approve=False,
+                        rejection_reason=rejection_reason,
+                    )
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    _set_auth_flash(
+                        f"{selected_request.username} 회원가입을 반려했습니다."
+                    )
+                    st.rerun()
+
     with create_tab:
         with st.form("admin_create_user_form", clear_on_submit=True):
             username = st.text_input(
@@ -870,7 +1022,9 @@ def user_management_page() -> None:
                     st.rerun()
 
     with manage_tab:
-        user_by_id = {user.id: user for user in users}
+        user_by_id = {
+            user.id: user for user in users if user.approval_status == "approved"
+        }
         selected_user_id = st.selectbox(
             "대상 계정",
             options=list(user_by_id),
