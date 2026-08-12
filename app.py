@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -92,12 +93,16 @@ HISTORICAL_STORE_RUNTIME_VERSION = 15
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 5
 KIS_UNIVERSE_RUNTIME_VERSION = 1
-AUTH_STORE_RUNTIME_VERSION = 3
+AUTH_STORE_RUNTIME_VERSION = 4
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
 KIS_MINUTE_REQUEST_INTERVAL_SECONDS = 1.0
 NXT_LIMIT_PROXIMITY_TICKS = 3
 AUTH_SESSION_USER_ID_KEY = "auth_user_id"
+AUTH_SESSION_TOKEN_KEY = "auth_session_token"
+AUTH_COOKIE_ACTION_KEY = "auth_cookie_action"
+AUTH_COOKIE_SUPPRESS_KEY = "auth_cookie_suppress"
 AUTH_FLASH_MESSAGE_KEY = "auth_flash_message"
+AUTH_SESSION_COOKIE_NAME = "nxt_auth_session"
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
     WatchSymbol("000660", "SK하이닉스"),
@@ -401,6 +406,9 @@ def get_auth_store() -> AuthStore:
         "request_signup",
         "review_signup_request",
         "delete_rejected_signup",
+        "create_persistent_session",
+        "authenticate_persistent_session",
+        "revoke_persistent_session",
     )
     if not all(hasattr(store, method_name) for method_name in required_methods):
         # Streamlit이 코드 배포 사이에 오래된 resource 객체를 유지한 경우에도
@@ -611,24 +619,122 @@ def _show_auth_flash() -> None:
         st.toast(message, icon="✅")
 
 
-def _clear_auth_session() -> None:
+def _queue_auth_cookie_set(token: str, expires_at: datetime) -> None:
+    max_age = max(
+        1,
+        int((expires_at - datetime.now(timezone.utc)).total_seconds()),
+    )
+    st.session_state[AUTH_COOKIE_ACTION_KEY] = {
+        "operation": "set",
+        "token": token,
+        "max_age": max_age,
+    }
+    st.session_state[AUTH_COOKIE_SUPPRESS_KEY] = False
+
+
+def _queue_auth_cookie_delete() -> None:
+    st.session_state[AUTH_COOKIE_ACTION_KEY] = {"operation": "delete"}
+    # st.context.cookies는 현재 연결의 최초 요청 쿠키를 계속 보여줄 수 있으므로,
+    # 삭제 스크립트가 실행된 뒤 새 요청이 올 때까지 해당 값을 다시 사용하지 않습니다.
+    st.session_state[AUTH_COOKIE_SUPPRESS_KEY] = True
+
+
+def _render_auth_cookie_action() -> None:
+    action = st.session_state.pop(AUTH_COOKIE_ACTION_KEY, None)
+    if not isinstance(action, dict):
+        return
+    cookie_name = json.dumps(AUTH_SESSION_COOKIE_NAME)
+    if action.get("operation") == "set":
+        token = json.dumps(str(action.get("token") or ""))
+        max_age = max(1, int(action.get("max_age") or 1))
+        assignment = (
+            f"{cookie_name} + '=' + encodeURIComponent({token}) + "
+            f"'; Path=/; Max-Age={max_age}; SameSite=Strict' + secure"
+        )
+    else:
+        assignment = (
+            f"{cookie_name} + '=; Path=/; Max-Age=0; SameSite=Strict' + secure"
+        )
+    st.components.v1.html(
+        f"""
+        <script>
+          const secure = window.location.protocol === 'https:' ? '; Secure' : '';
+          document.cookie = {assignment};
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _browser_auth_token() -> str:
+    session_token = str(st.session_state.get(AUTH_SESSION_TOKEN_KEY) or "").strip()
+    if session_token:
+        return session_token
+    if st.session_state.get(AUTH_COOKIE_SUPPRESS_KEY):
+        return ""
+    try:
+        return str(st.context.cookies.get(AUTH_SESSION_COOKIE_NAME, "")).strip()
+    except (AttributeError, KeyError, RuntimeError):
+        return ""
+
+
+def _start_auth_session(user: AuthUser) -> None:
+    token, expires_at = get_auth_store().create_persistent_session(user_id=user.id)
+    st.session_state[AUTH_SESSION_USER_ID_KEY] = user.id
+    st.session_state[AUTH_SESSION_TOKEN_KEY] = token
+    _queue_auth_cookie_set(token, expires_at)
+
+
+def _clear_auth_session(*, revoke: bool = True) -> None:
+    token = _browser_auth_token()
+    if revoke and token:
+        try:
+            get_auth_store().revoke_persistent_session(token)
+        except (AuthConfigurationError, AuthError):
+            pass
     st.session_state.pop(AUTH_SESSION_USER_ID_KEY, None)
+    st.session_state.pop(AUTH_SESSION_TOKEN_KEY, None)
     st.session_state.pop(AUTH_FLASH_MESSAGE_KEY, None)
+    _queue_auth_cookie_delete()
 
 
 def _current_auth_user() -> AuthUser | None:
     raw_user_id = st.session_state.get(AUTH_SESSION_USER_ID_KEY)
     if raw_user_id is None:
-        return None
+        token = _browser_auth_token()
+        if not token:
+            return None
+        user = get_auth_store().authenticate_persistent_session(token)
+        if user is None:
+            _clear_auth_session(revoke=False)
+            return None
+        st.session_state[AUTH_SESSION_USER_ID_KEY] = user.id
+        st.session_state[AUTH_SESSION_TOKEN_KEY] = token
+        return user
     try:
         user_id = int(raw_user_id)
     except (TypeError, ValueError):
         _clear_auth_session()
         return None
-    user = get_auth_store().get_user(user_id)
-    if user is None or not user.is_active or not user.is_approved:
-        _clear_auth_session()
-        return None
+    token = _browser_auth_token()
+    if token:
+        user = get_auth_store().authenticate_persistent_session(token)
+        if user is None or user.id != user_id:
+            _clear_auth_session(revoke=False)
+            return None
+    else:
+        # 배포 전에 생성되어 브라우저 세션에 사용자 ID만 남은 로그인도 한 번은
+        # 인정하되, 즉시 지속 세션 토큰을 발급해 이후 요청부터 동일하게 검증합니다.
+        user = get_auth_store().get_user(user_id)
+        if user is None or not user.is_active or not user.is_approved:
+            _clear_auth_session(revoke=False)
+            return None
+        try:
+            _start_auth_session(user)
+        except AuthError:
+            _clear_auth_session(revoke=False)
+            return None
     return user
 
 
@@ -700,7 +806,7 @@ def _render_initial_admin_setup() -> None:
     except AuthError as exc:
         st.error(str(exc))
         return
-    st.session_state[AUTH_SESSION_USER_ID_KEY] = user.id
+    _start_auth_session(user)
     _set_auth_flash("초기 관리자 계정이 생성되었습니다.")
     st.rerun()
 
@@ -730,7 +836,7 @@ def _render_login_page() -> None:
             )
         st.caption(
             "회원가입 신청은 관리자 승인 후 사용할 수 있습니다. 로그인에 5회 실패하면 "
-            "계정이 15분간 잠깁니다."
+            "계정이 15분간 잠기며, 로그인 상태는 12시간 유지됩니다."
         )
         if login_submitted:
             result = get_auth_store().authenticate_with_status(username, password)
@@ -748,8 +854,12 @@ def _render_login_page() -> None:
             elif result.user is None:
                 st.error("로그인하지 못했습니다. 아이디와 비밀번호를 확인하세요.")
             else:
-                st.session_state[AUTH_SESSION_USER_ID_KEY] = result.user.id
-                st.rerun()
+                try:
+                    _start_auth_session(result.user)
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    st.rerun()
 
     with signup_tab:
         st.caption("아이디·사번·이름·비밀번호를 입력하면 관리자 승인 대기 상태로 접수됩니다.")
@@ -761,7 +871,8 @@ def _render_login_page() -> None:
             )
             signup_employee_number = st.text_input(
                 "사번",
-                help="영문자·숫자·밑줄·하이픈 2~30자",
+                max_chars=6,
+                help="숫자 6자리",
                 key="signup_employee_number",
             )
             signup_display_name = st.text_input("이름", key="signup_display_name")
@@ -4783,6 +4894,7 @@ def main() -> None:
         _render_initial_admin_setup()
         return
     auth_user = _current_auth_user()
+    _render_auth_cookie_action()
     if auth_user is None:
         _render_login_page()
         return

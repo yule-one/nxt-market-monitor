@@ -16,6 +16,15 @@ class _CurrentAuthStoreStub:
     def delete_rejected_signup(self) -> None:
         return None
 
+    def create_persistent_session(self) -> None:
+        return None
+
+    def authenticate_persistent_session(self) -> None:
+        return None
+
+    def revoke_persistent_session(self) -> None:
+        return None
+
 
 class _AuthStoreFactoryStub:
     def __init__(self) -> None:
