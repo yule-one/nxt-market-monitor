@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -14,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import extra_streamlit_components as stx
 
 from src.analytics import (
     build_daily_metrics,
@@ -103,6 +103,7 @@ AUTH_COOKIE_ACTION_KEY = "auth_cookie_action"
 AUTH_COOKIE_SUPPRESS_KEY = "auth_cookie_suppress"
 AUTH_FLASH_MESSAGE_KEY = "auth_flash_message"
 AUTH_SESSION_COOKIE_NAME = "nxt_auth_session"
+AUTH_COOKIE_COMPONENT_KEY = "nxt_auth_cookie_reader"
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
     WatchSymbol("000660", "SK하이닉스"),
@@ -639,42 +640,57 @@ def _queue_auth_cookie_delete() -> None:
     st.session_state[AUTH_COOKIE_SUPPRESS_KEY] = True
 
 
-def _render_auth_cookie_action() -> None:
+def _auth_cookie_is_secure() -> bool:
+    try:
+        headers = st.context.headers
+        forwarded_proto = str(headers.get("X-Forwarded-Proto", "")).split(",")[0].strip()
+        if forwarded_proto:
+            return forwarded_proto.lower() == "https"
+        return str(headers.get("Origin", "")).lower().startswith("https://")
+    except (AttributeError, KeyError, RuntimeError):
+        return False
+
+
+def _render_auth_cookie_action(cookie_manager: stx.CookieManager) -> None:
     action = st.session_state.pop(AUTH_COOKIE_ACTION_KEY, None)
     if not isinstance(action, dict):
         return
-    cookie_name = json.dumps(AUTH_SESSION_COOKIE_NAME)
-    if action.get("operation") == "set":
-        token = json.dumps(str(action.get("token") or ""))
-        max_age = max(1, int(action.get("max_age") or 1))
-        assignment = (
-            f"{cookie_name} + '=' + encodeURIComponent({token}) + "
-            f"'; Path=/; Max-Age={max_age}; SameSite=Strict' + secure"
-        )
-    else:
-        assignment = (
-            f"{cookie_name} + '=; Path=/; Max-Age=0; SameSite=Strict' + secure"
-        )
-    st.components.v1.html(
-        f"""
-        <script>
-          const secure = window.location.protocol === 'https:' ? '; Secure' : '';
-          document.cookie = {assignment};
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
+    try:
+        if action.get("operation") == "set":
+            token = str(action.get("token") or "").strip()
+            max_age = max(1, int(action.get("max_age") or 1))
+            if token:
+                cookie_manager.set(
+                    AUTH_SESSION_COOKIE_NAME,
+                    token,
+                    key="nxt_auth_cookie_set",
+                    path="/",
+                    expires_at=datetime.now(timezone.utc) + timedelta(seconds=max_age),
+                    max_age=max_age,
+                    secure=_auth_cookie_is_secure(),
+                    same_site="strict",
+                )
+        elif cookie_manager.get(AUTH_SESSION_COOKIE_NAME) is not None:
+            cookie_manager.delete(
+                AUTH_SESSION_COOKIE_NAME,
+                key="nxt_auth_cookie_delete",
+            )
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        LOGGER.warning("브라우저 로그인 쿠키 처리에 실패했습니다: %s", exc)
 
 
-def _browser_auth_token() -> str:
+def _browser_auth_token(
+    cookie_manager: stx.CookieManager | None = None,
+) -> str:
     session_token = str(st.session_state.get(AUTH_SESSION_TOKEN_KEY) or "").strip()
     if session_token:
         return session_token
     if st.session_state.get(AUTH_COOKIE_SUPPRESS_KEY):
         return ""
+    if cookie_manager is None:
+        return ""
     try:
-        return str(st.context.cookies.get(AUTH_SESSION_COOKIE_NAME, "")).strip()
+        return str(cookie_manager.get(AUTH_SESSION_COOKIE_NAME) or "").strip()
     except (AttributeError, KeyError, RuntimeError):
         return ""
 
@@ -699,10 +715,12 @@ def _clear_auth_session(*, revoke: bool = True) -> None:
     _queue_auth_cookie_delete()
 
 
-def _current_auth_user() -> AuthUser | None:
+def _current_auth_user(
+    cookie_manager: stx.CookieManager | None = None,
+) -> AuthUser | None:
     raw_user_id = st.session_state.get(AUTH_SESSION_USER_ID_KEY)
     if raw_user_id is None:
-        token = _browser_auth_token()
+        token = _browser_auth_token(cookie_manager)
         if not token:
             return None
         user = get_auth_store().authenticate_persistent_session(token)
@@ -836,7 +854,7 @@ def _render_login_page() -> None:
             )
         st.caption(
             "회원가입 신청은 관리자 승인 후 사용할 수 있습니다. 로그인에 5회 실패하면 "
-            "계정이 15분간 잠기며, 로그인 상태는 12시간 유지됩니다."
+            "계정이 15분간 잠깁니다."
         )
         if login_submitted:
             result = get_auth_store().authenticate_with_status(username, password)
@@ -4893,8 +4911,9 @@ def main() -> None:
     if not auth_store.has_users():
         _render_initial_admin_setup()
         return
-    auth_user = _current_auth_user()
-    _render_auth_cookie_action()
+    cookie_manager = stx.CookieManager(key=AUTH_COOKIE_COMPONENT_KEY)
+    _render_auth_cookie_action(cookie_manager)
+    auth_user = _current_auth_user(cookie_manager)
     if auth_user is None:
         _render_login_page()
         return
