@@ -1,6 +1,6 @@
 # NEXTRADE 시장운영 DASHBOARD
 
-한국투자증권 KIS Open API로 관심종목의 KRX/NXT 실시간 가격·거래량·거래대금을 비교하고, 기존 KIND 시장조치와 넥스트레이드 종목 현황도 함께 조회하는 Streamlit 앱입니다.
+한국투자증권 KIS Open API로 NXT 대상종목의 KRX/NXT 가격·거래량·거래대금을 비교하고, KIND 시장조치와 넥스트레이드 종목 현황도 함께 조회하는 Streamlit 앱입니다.
 
 ## 웹 접속
 
@@ -11,6 +11,9 @@
 
 1. **NXT DASHBOARD**
    - 최신 NXT 대상 전종목의 KRX/NXT 누적 시세 조회
+   - KIS 코스피·코스닥 종목 마스터에서 보통주 후보군을 만들고 KIS NXT REST 시세로 당일 대상종목을 계산
+   - 직전 대상종목 중 KIS 마스터에 거래정지·관리·단기과열·투자경고/위험이 표시된 종목은 NXT 시세가 0이어도 거래불가 종목으로 보존
+   - KIS WebSocket은 최근 저장 NXT 거래대금 상위 최대 20종목의 연결·실시간 수신 정상 여부 확인에 사용
    - 과거일은 NXT 공식 종가와 KRX OPEN API 종목·지수 종가를 결합해 동일한 비교표 제공
    - KOSPI, KOSDAQ, KOSPI200, KOSDAQ150 현재지수 표시
    - KOSPI200 선물·KOSPI200 야간선물 최근월물 현재가 표시
@@ -18,7 +21,7 @@
    - 전체 갱신 목표 주기 10초로 고정
    - 최대 5명 동시 접속을 고려해 전 종목 REST는 초당 약 5건, 분봉 전용 큐는 초당 1건으로 제한
    - NXT 휴장 구간인 08:50~09:00에는 전 종목·분봉 REST 조회를 중지
-   - NXT 거래대금 내림차순 정렬과 NXT 거래불가사유 표시
+   - NXT 거래대금 내림차순 정렬과 KIS 시장조치 및 로컬 NXT 대사로 확인한 거래불가사유 표시
    - 종목별 KRX 현재가와 시가총액 표시(장중은 현재가×상장주식수, 과거는 KRX MKTCAP)
    - 종목표 위 NXT·KRX 시장 거래량·거래대금 합계와 NXT/KRX 비율 표시
    - 전체 진행률, 실제 완료시간, 검색 및 KOSPI/KOSDAQ 필터 제공
@@ -75,9 +78,32 @@ streamlit run app.py
 
 `.streamlit/secrets.toml.example`을 `.streamlit/secrets.toml`로 복사한 뒤 KIS Developers 키와 과거일 조회용 `KRX_KEY`를 입력합니다. 상세 내용은 [KIS 실시간 설정](docs/kis_realtime.md)을 참고하세요.
 
-앱은 과거일 대시보드 데이터를 `data/history.db`에 날짜·종목 단위로 정규화해 저장합니다. NXT 공식 종목행, NXT 대상 종목의 KRX 확정행, 4개 지수행, 일별 합계를 저장하므로 같은 과거일을 다시 볼 때 API를 호출하지 않습니다. 공시·원본 응답 캐시는 `data/cache.db`, 당일 수집 상태는 `data/kis_market.db`를 사용합니다.
+### 로그인 및 사용자 관리
 
-배포 저장소에는 확정 과거 데이터의 압축 시드인 `data/history.db.gz`를 포함합니다. 새 Streamlit 인스턴스에서 `history.db`가 없으면 이 시드를 자동 복원하므로 과거 화면을 즉시 조회할 수 있습니다. `cache.db`와 `kis_market.db`는 각각 재생성 가능한 API 캐시와 장중 임시 상태이므로 Git에는 포함하지 않습니다. 실행 중 추가된 DB 변경은 컨테이너 재시작 시 유지되지 않으므로, 확정 데이터 시드는 필요할 때 다시 생성해 Git에 반영해야 합니다.
+앱을 처음 실행하면 초기 관리자 계정을 한 번 생성합니다. 공개 회원가입은 없으며, 이후 관리자는 사이드바의 `사용자 관리` 화면에서 계정 발급, 관리자·일반 사용자 권한 변경, 계정 활성화·비활성화, 로그인 잠금 해제와 임시 비밀번호 발급을 할 수 있습니다. 임시 비밀번호로 로그인한 사용자는 대시보드에 들어가기 전에 비밀번호를 반드시 변경해야 합니다.
+
+`AUTH_DATABASE_URL`이 설정되면 계정과 감사기록을 PostgreSQL에 영구 저장하고, 설정하지 않은 로컬 개발환경에서는 `data/auth.db`를 사용합니다. 비밀번호 원문은 저장하지 않으며 로컬 DB는 Git 제외 대상입니다. 기존 SQLite 계정은 `python scripts\migrate_auth_to_postgres.py`로 빈 PostgreSQL에 이전할 수 있습니다. 자세한 설정과 이전 방법은 [로그인·사용자 관리 안내](docs/authentication.md)를 참고하세요.
+
+앱은 과거일 대시보드 데이터를 `data/history.db`에 날짜·종목 단위로 정규화해 저장합니다. NXT 공식 종목행, NXT 대상 종목의 KRX 확정행, 4개 지수행, 일별 합계를 저장하므로 같은 과거일을 다시 볼 때 API를 호출하지 않습니다. 공시·원본 응답 캐시는 `data/cache.db`, 당일 수집 상태는 `data/kis_market.db`, KIS 계산 대상종목과 NXT 공식 대사 결과는 `data/kis_universe.db`를 사용합니다.
+
+배포 저장소에는 확정 과거 데이터의 `data/history.db.gz`와 KIS 대상종목의 `data/kis_universe.db.gz` 압축 시드를 포함할 수 있습니다. 새 Streamlit 인스턴스에서 원본 DB가 없으면 시드를 자동 복원합니다. `cache.db`, `kis_market.db`, `kis_universe_ws.db`는 재생성 가능한 캐시·장중 상태이므로 Git에 포함하지 않습니다. 실행 중 추가된 DB 변경은 컨테이너 재시작 시 유지되지 않으므로 시드는 필요할 때 다시 생성해 Git에 반영해야 합니다.
+
+### KIS 기준 NXT 대상종목·로컬 NXT 대사
+
+Streamlit 화면은 NXT 홈페이지를 직접 호출하지 않습니다. 화면은 `kis_universe.db`와 `history.db`만 읽고, 서버의 KIS 대상종목 계산은 프로세스당 하루 한 번만 백그라운드에서 실행됩니다. 전 종목 장중 가격·누적 거래량·거래대금은 기존의 공유 REST 수집기 한 개가 갱신하므로 동시 접속자마다 별도 호출하지 않습니다.
+
+로컬 PC에서는 다음 명령으로 KIS 계산 결과를 만들고 NXT 공식 거래현황을 한 번 조회해 종목 포함 여부와 거래가능시장·거래불가사유를 대사합니다. NXT 공식 명단은 KIS 대상종목을 대체하지 않고, 불일치 이력 저장과 일치 종목의 상태 메타데이터 보정에만 사용합니다.
+
+```powershell
+python scripts\sync_kis_nxt_universe.py --reconcile-official
+python scripts\build_kis_universe_seed.py
+```
+
+하루 두 번(08:10, 18:10) 자동 대사를 원하면 아래 스크립트를 한 번 실행해 Windows 작업 스케줄러에 등록합니다. 08:50~09:00 NXT 휴장 구간에는 예약하지 않았으며, 앱의 REST·WebSocket 자동 수집도 이 구간과 08:00~20:05 밖에서는 중지합니다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register_nxt_universe_reconciliation_task.ps1
+```
 
 전체 과거 데이터는 다음 명령으로 누락분만 추가 저장할 수 있습니다.
 
