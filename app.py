@@ -712,6 +712,10 @@ def _render_login_page() -> None:
     )
     login_tab, signup_tab = st.tabs(["로그인", "회원가입 신청"])
     with login_tab:
+        st.info(
+            "넥스트레이드 직원만 사용할 수 있습니다. 넥스트레이드 직원이신 경우, "
+            "회원가입을 신청하시면 관리자가 최대한 빠르게 승인 처리해 드립니다."
+        )
         with st.form("login_form", clear_on_submit=False):
             username = st.text_input("아이디", autocomplete="username")
             password = st.text_input(
@@ -748,7 +752,7 @@ def _render_login_page() -> None:
                 st.rerun()
 
     with signup_tab:
-        st.caption("아이디·비밀번호·사번·이름을 입력하면 관리자 승인 대기 상태로 접수됩니다.")
+        st.caption("아이디·사번·이름·비밀번호를 입력하면 관리자 승인 대기 상태로 접수됩니다.")
         with st.form("signup_request_form", clear_on_submit=True):
             signup_username = st.text_input(
                 "아이디",
@@ -779,8 +783,9 @@ def _render_login_page() -> None:
                 type="primary",
                 use_container_width=True,
             )
+        st.caption("사번과 이름은 넥스트레이드 직원 여부를 확인하기 위해서만 사용됩니다.")
         st.caption(
-            "사번과 이름은 가입 승인 및 계정 관리 목적으로만 인증 DB에 저장됩니다."
+            "비밀번호는 단방향 해시 처리되어 저장되므로 관리자도 확인할 수 없습니다."
         )
         if signup_submitted:
             if signup_password != signup_password_confirm:
