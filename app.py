@@ -104,6 +104,7 @@ AUTH_COOKIE_SUPPRESS_KEY = "auth_cookie_suppress"
 AUTH_FLASH_MESSAGE_KEY = "auth_flash_message"
 AUTH_SESSION_COOKIE_NAME = "nxt_auth_session"
 AUTH_COOKIE_COMPONENT_KEY = "nxt_auth_cookie_reader"
+AUTH_DISPLAY_TIMEZONE = timezone(timedelta(hours=9), name="KST")
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
     WatchSymbol("000660", "SK하이닉스"),
@@ -759,7 +760,9 @@ def _current_auth_user(
 def _format_auth_time(value: datetime | None) -> str:
     if value is None:
         return "-"
-    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(AUTH_DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
 
 def _render_initial_admin_setup() -> None:
@@ -1022,6 +1025,7 @@ def user_management_page() -> None:
         "회원가입 신청의 사번과 이름을 확인해 승인하거나 반려할 수 있습니다. 관리자가 직접 "
         "발급한 계정은 첫 로그인 시 임시 비밀번호를 변경해야 합니다."
     )
+    st.caption("회원가입·로그인·관리기록 시각은 한국시간(KST)으로 표시됩니다.")
     st.caption(f"계정 저장소: {store.storage_label}")
     users = store.list_users()
     pending_users = store.list_signup_requests(actor_user_id=actor.id)
