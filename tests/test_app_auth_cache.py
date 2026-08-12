@@ -13,6 +13,9 @@ class _CurrentAuthStoreStub:
     def review_signup_request(self) -> None:
         return None
 
+    def delete_rejected_signup(self) -> None:
+        return None
+
 
 class _AuthStoreFactoryStub:
     def __init__(self) -> None:

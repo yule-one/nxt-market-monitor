@@ -92,7 +92,7 @@ HISTORICAL_STORE_RUNTIME_VERSION = 15
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 5
 KIS_UNIVERSE_RUNTIME_VERSION = 1
-AUTH_STORE_RUNTIME_VERSION = 2
+AUTH_STORE_RUNTIME_VERSION = 3
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
 KIS_MINUTE_REQUEST_INTERVAL_SECONDS = 1.0
 NXT_LIMIT_PROXIMITY_TICKS = 3
@@ -400,6 +400,7 @@ def get_auth_store() -> AuthStore:
         "authenticate_with_status",
         "request_signup",
         "review_signup_request",
+        "delete_rejected_signup",
     )
     if not all(hasattr(store, method_name) for method_name in required_methods):
         # Streamlit이 코드 배포 사이에 오래된 resource 객체를 유지한 경우에도
@@ -890,6 +891,10 @@ def user_management_page() -> None:
     st.caption(f"계정 저장소: {store.storage_label}")
     users = store.list_users()
     pending_users = store.list_signup_requests(actor_user_id=actor.id)
+    rejected_users = store.list_signup_requests(
+        actor_user_id=actor.id,
+        status="rejected",
+    )
     now = datetime.now(timezone.utc)
     user_rows = [
         {
@@ -998,6 +1003,65 @@ def user_management_page() -> None:
                 else:
                     _set_auth_flash(
                         f"{selected_request.username} 회원가입을 반려했습니다."
+                    )
+                    st.rerun()
+
+        st.divider()
+        st.subheader(f"반려 계정 삭제 ({len(rejected_users)})")
+        st.caption(
+            "삭제하면 해당 아이디와 사번으로 다시 회원가입을 신청할 수 있습니다. "
+            "가입 반려와 삭제 감사기록은 보존됩니다."
+        )
+        if not rejected_users:
+            st.info("삭제할 반려 계정이 없습니다.")
+        else:
+            rejected_rows = [
+                {
+                    "처리일시": _format_auth_time(user.decision_at),
+                    "아이디": user.username,
+                    "사번": user.employee_number or "-",
+                    "이름": user.display_name,
+                    "반려 사유": user.rejection_reason or "-",
+                }
+                for user in rejected_users
+            ]
+            st.dataframe(
+                pd.DataFrame(rejected_rows),
+                hide_index=True,
+                use_container_width=True,
+            )
+            rejected_by_id = {user.id: user for user in rejected_users}
+            selected_rejected_id = st.selectbox(
+                "삭제할 반려 계정",
+                options=list(rejected_by_id),
+                format_func=lambda user_id: (
+                    f"{rejected_by_id[user_id].username} · "
+                    f"{rejected_by_id[user_id].employee_number or '-'} · "
+                    f"{rejected_by_id[user_id].display_name}"
+                ),
+                key="admin_selected_rejected_signup_id",
+            )
+            selected_rejected = rejected_by_id[selected_rejected_id]
+            delete_confirmed = st.checkbox(
+                f"{selected_rejected.username} 반려 계정을 삭제합니다.",
+                key=f"confirm_delete_rejected_{selected_rejected.id}",
+            )
+            if st.button(
+                "반려 계정 삭제",
+                disabled=not delete_confirmed,
+                use_container_width=True,
+                key=f"delete_rejected_signup_{selected_rejected.id}",
+            ):
+                try:
+                    store.delete_rejected_signup(
+                        actor_user_id=actor.id,
+                        target_user_id=selected_rejected.id,
+                    )
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    _set_auth_flash(
+                        f"{selected_rejected.username} 반려 계정을 삭제했습니다."
                     )
                     st.rerun()
 
