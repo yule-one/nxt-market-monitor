@@ -3,14 +3,15 @@ from __future__ import annotations
 import logging
 import os
 import re
+import hmac
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from html import escape
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
-from requests import RequestException
 import streamlit as st
 
 from src.analytics import (
@@ -26,6 +27,7 @@ from src.analytics import (
     summarize_daily_nxt_unavailability_reasons,
     summarize_nxt_membership_flow,
 )
+from src.auth import AuthConfigurationError, AuthError, AuthStore, AuthUser
 from src.cache import ResponseCache
 from src.config import (
     CATEGORY_CODES,
@@ -50,6 +52,12 @@ from src.kis_rest import (
     build_market_totals,
     build_nxt_weighted_change_rates,
     exclude_unavailable_nxt_quotes,
+)
+from src.kis_universe import (
+    KisNxtUniverseResolver,
+    KisNxtUniverseStore,
+    KisNxtUniverseSyncService,
+    select_websocket_anchor_symbols,
 )
 from src.kis_websocket import KisCredentials, KisRealtimeCollector
 from src.market_realtime import NXT, MarketAggregator, MarketDataStore, WatchSymbol
@@ -83,9 +91,12 @@ REST_UNIVERSE_RUNTIME_VERSION = 12
 HISTORICAL_STORE_RUNTIME_VERSION = 15
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 5
+KIS_UNIVERSE_RUNTIME_VERSION = 1
 KIS_SHARED_MIN_REQUEST_INTERVAL_SECONDS = 0.20
 KIS_MINUTE_REQUEST_INTERVAL_SECONDS = 1.0
 NXT_LIMIT_PROXIMITY_TICKS = 3
+AUTH_SESSION_USER_ID_KEY = "auth_user_id"
+AUTH_FLASH_MESSAGE_KEY = "auth_flash_message"
 DEFAULT_KIS_WATCHLIST = [
     WatchSymbol("005930", "삼성전자"),
     WatchSymbol("000660", "SK하이닉스"),
@@ -244,7 +255,7 @@ st.markdown(
       .compact-status-strip {
         display: grid;
         gap: 0.5rem;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
+        grid-template-columns: repeat(6, minmax(0, 1fr));
         margin: 0.1rem 0 0.65rem;
       }
       .compact-status-item {
@@ -371,6 +382,11 @@ st.markdown(
 @st.cache_resource
 def get_response_cache() -> ResponseCache:
     return ResponseCache()
+
+
+@st.cache_resource
+def get_auth_store() -> AuthStore:
+    return AuthStore(database_url=_secret_value("AUTH_DATABASE_URL") or None)
 
 
 @st.cache_resource
@@ -507,6 +523,53 @@ def get_rest_universe_runtime(
     return KisRestUniverseCollector(client, response_cache=get_response_cache())
 
 
+@st.cache_resource
+def _get_kis_nxt_universe_store(runtime_version: int) -> KisNxtUniverseStore:
+    _ = runtime_version
+    return KisNxtUniverseStore()
+
+
+def get_kis_nxt_universe_store() -> KisNxtUniverseStore:
+    return _get_kis_nxt_universe_store(KIS_UNIVERSE_RUNTIME_VERSION)
+
+
+@st.cache_resource
+def get_kis_nxt_universe_sync_service(
+    app_key: str,
+    app_secret: str,
+    runtime_version: int,
+) -> KisNxtUniverseSyncService:
+    _ = runtime_version
+    resolver = KisNxtUniverseResolver(
+        get_shared_kis_rest_client(
+            app_key,
+            app_secret,
+            KIS_SHARED_CLIENT_RUNTIME_VERSION,
+        ),
+        get_kis_nxt_universe_store(),
+        previous_status_loader=get_historical_market_store().load_latest_nxt_statuses,
+    )
+    return KisNxtUniverseSyncService(resolver)
+
+
+@st.cache_resource
+def get_universe_websocket_runtime(
+    app_key: str,
+    app_secret: str,
+    runtime_version: int,
+) -> tuple[MarketAggregator, KisRealtimeCollector]:
+    _ = runtime_version
+    store = MarketDataStore(
+        Path(__file__).resolve().parent / "data" / "kis_universe_ws.db"
+    )
+    aggregator = MarketAggregator(store)
+    collector = KisRealtimeCollector(
+        KisCredentials(app_key=app_key, app_secret=app_secret),
+        aggregator,
+    )
+    return aggregator, collector
+
+
 def _secret_value(name: str) -> str:
     environment_value = os.getenv(name, "").strip()
     if environment_value:
@@ -515,6 +578,423 @@ def _secret_value(name: str) -> str:
         return str(st.secrets.get(name, "")).strip()
     except (FileNotFoundError, KeyError):
         return ""
+
+
+def _set_auth_flash(message: str) -> None:
+    st.session_state[AUTH_FLASH_MESSAGE_KEY] = message
+
+
+def _show_auth_flash() -> None:
+    message = st.session_state.pop(AUTH_FLASH_MESSAGE_KEY, "")
+    if message:
+        st.toast(message, icon="✅")
+
+
+def _clear_auth_session() -> None:
+    st.session_state.pop(AUTH_SESSION_USER_ID_KEY, None)
+    st.session_state.pop(AUTH_FLASH_MESSAGE_KEY, None)
+
+
+def _current_auth_user() -> AuthUser | None:
+    raw_user_id = st.session_state.get(AUTH_SESSION_USER_ID_KEY)
+    if raw_user_id is None:
+        return None
+    try:
+        user_id = int(raw_user_id)
+    except (TypeError, ValueError):
+        _clear_auth_session()
+        return None
+    user = get_auth_store().get_user(user_id)
+    if user is None or not user.is_active:
+        _clear_auth_session()
+        return None
+    return user
+
+
+def _format_auth_time(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def _render_initial_admin_setup() -> None:
+    store = get_auth_store()
+    st.markdown(
+        '<div class="nextrade-dashboard-title">초기 관리자 설정</div>',
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "최초 한 번만 관리자 계정을 생성합니다. 이후에는 관리자가 사용자 계정을 직접 발급하며, "
+        "공개 회원가입은 제공하지 않습니다."
+    )
+    setup_token = _secret_value("AUTH_SETUP_TOKEN")
+    if not setup_token:
+        if store.backend_name == "postgresql":
+            st.warning(
+                "PostgreSQL은 연결됐지만 초기 설정 토큰이 없습니다. 외부에서 접근할 수 있게 "
+                "하기 전 AUTH_SETUP_TOKEN을 Secrets에 설정하세요."
+            )
+        else:
+            st.warning(
+                "현재는 로컬 초기 설정 모드입니다. 외부에 공개하기 전에는 AUTH_SETUP_TOKEN과 "
+                "AUTH_DATABASE_URL을 Secrets에 설정하세요."
+            )
+    st.caption(f"계정 저장소: {store.storage_label}")
+    with st.form("initial_admin_setup_form", clear_on_submit=False):
+        username = st.text_input(
+            "관리자 아이디",
+            value="admin",
+            help="영문 소문자·숫자·마침표·밑줄·하이픈 3~32자",
+        )
+        display_name = st.text_input("표시 이름", value="관리자")
+        if setup_token:
+            provided_setup_token = st.text_input("초기 설정 토큰", type="password")
+        else:
+            provided_setup_token = ""
+        password = st.text_input(
+            "비밀번호",
+            type="password",
+            help="10자 이상이며 영문자와 숫자를 각각 하나 이상 포함해야 합니다.",
+        )
+        password_confirm = st.text_input("비밀번호 확인", type="password")
+        submitted = st.form_submit_button(
+            "관리자 계정 생성",
+            type="primary",
+            use_container_width=True,
+        )
+    if not submitted:
+        return
+    if setup_token and not hmac.compare_digest(provided_setup_token, setup_token):
+        st.error("초기 설정 토큰이 일치하지 않습니다.")
+        return
+    if password != password_confirm:
+        st.error("비밀번호 확인이 일치하지 않습니다.")
+        return
+    try:
+        user = store.create_initial_admin(
+            username=username,
+            display_name=display_name,
+            password=password,
+        )
+    except AuthError as exc:
+        st.error(str(exc))
+        return
+    st.session_state[AUTH_SESSION_USER_ID_KEY] = user.id
+    _set_auth_flash("초기 관리자 계정이 생성되었습니다.")
+    st.rerun()
+
+
+def _render_login_page() -> None:
+    st.markdown(
+        '<div class="nextrade-dashboard-title">NEXTRADE 시장운영 DASHBOARD</div>',
+        unsafe_allow_html=True,
+    )
+    st.subheader("로그인")
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("아이디", autocomplete="username")
+        password = st.text_input(
+            "비밀번호",
+            type="password",
+            autocomplete="current-password",
+        )
+        submitted = st.form_submit_button(
+            "로그인",
+            type="primary",
+            use_container_width=True,
+        )
+    st.caption(
+        "회원가입 기능은 없습니다. 계정 발급 또는 비밀번호 초기화는 관리자에게 요청하세요. "
+        "로그인에 5회 실패하면 계정이 15분간 잠깁니다."
+    )
+    if not submitted:
+        return
+    user = get_auth_store().authenticate(username, password)
+    if user is None:
+        st.error("로그인하지 못했습니다. 아이디·비밀번호 또는 계정 상태를 확인하세요.")
+        return
+    st.session_state[AUTH_SESSION_USER_ID_KEY] = user.id
+    st.rerun()
+
+
+def _render_password_change_form(user: AuthUser, *, forced: bool) -> None:
+    if forced:
+        st.warning("관리자가 발급하거나 초기화한 임시 비밀번호를 먼저 변경해야 합니다.")
+    form_key = "forced_password_change_form" if forced else "password_change_form"
+    with st.form(form_key, clear_on_submit=True):
+        current_password = st.text_input(
+            "현재 비밀번호",
+            type="password",
+            autocomplete="current-password",
+            key=f"{form_key}_current",
+        )
+        new_password = st.text_input(
+            "새 비밀번호",
+            type="password",
+            autocomplete="new-password",
+            help="10자 이상이며 영문자와 숫자를 각각 하나 이상 포함해야 합니다.",
+            key=f"{form_key}_new",
+        )
+        new_password_confirm = st.text_input(
+            "새 비밀번호 확인",
+            type="password",
+            autocomplete="new-password",
+            key=f"{form_key}_confirm",
+        )
+        submitted = st.form_submit_button(
+            "비밀번호 변경",
+            type="primary",
+            use_container_width=True,
+        )
+    if not submitted:
+        return
+    if new_password != new_password_confirm:
+        st.error("새 비밀번호 확인이 일치하지 않습니다.")
+        return
+    try:
+        get_auth_store().change_password(
+            user_id=user.id,
+            current_password=current_password,
+            new_password=new_password,
+        )
+    except AuthError as exc:
+        st.error(str(exc))
+        return
+    _set_auth_flash("비밀번호가 변경되었습니다.")
+    st.rerun()
+
+
+def _render_forced_password_change(user: AuthUser) -> None:
+    st.markdown(
+        '<div class="nextrade-dashboard-title">비밀번호 변경</div>',
+        unsafe_allow_html=True,
+    )
+    st.write(f"**{user.display_name}** (`{user.username}`) 계정으로 로그인했습니다.")
+    _render_password_change_form(user, forced=True)
+    if st.button("로그아웃", use_container_width=True):
+        _clear_auth_session()
+        st.rerun()
+
+
+def my_account_page() -> None:
+    user = _current_auth_user()
+    if user is None:
+        st.error("로그인 정보가 만료되었습니다.")
+        st.stop()
+    st.header("내 계정")
+    role_label = "관리자" if user.is_admin else "일반 사용자"
+    account_col, role_col, login_col = st.columns(3)
+    account_col.metric("아이디", user.username)
+    role_col.metric("권한", role_label)
+    login_col.metric("최근 로그인", _format_auth_time(user.last_login_at))
+    st.subheader("비밀번호 변경")
+    _render_password_change_form(user, forced=False)
+
+
+def user_management_page() -> None:
+    actor = _current_auth_user()
+    if actor is None or not actor.is_admin:
+        st.error("관리자 권한이 필요합니다.")
+        st.stop()
+    store = get_auth_store()
+    st.header("사용자 관리")
+    st.caption(
+        "공개 회원가입 없이 관리자가 계정을 발급합니다. 새 계정과 비밀번호 초기화 계정은 "
+        "다음 로그인 시 비밀번호를 반드시 변경해야 합니다."
+    )
+    st.caption(f"계정 저장소: {store.storage_label}")
+    users = store.list_users()
+    now = datetime.now(timezone.utc)
+    user_rows = [
+        {
+            "아이디": user.username,
+            "표시 이름": user.display_name,
+            "권한": "관리자" if user.is_admin else "일반 사용자",
+            "상태": "활성" if user.is_active else "비활성",
+            "비밀번호 변경 필요": "예" if user.must_change_password else "아니오",
+            "잠금": (
+                _format_auth_time(user.locked_until)
+                if user.locked_until is not None and user.locked_until > now
+                else "-"
+            ),
+            "최근 로그인": _format_auth_time(user.last_login_at),
+        }
+        for user in users
+    ]
+    st.dataframe(
+        pd.DataFrame(user_rows),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    create_tab, manage_tab, audit_tab = st.tabs(
+        ["계정 발급", "계정 설정", "관리 기록"]
+    )
+    with create_tab:
+        with st.form("admin_create_user_form", clear_on_submit=True):
+            username = st.text_input(
+                "아이디",
+                help="영문 소문자·숫자·마침표·밑줄·하이픈 3~32자",
+            )
+            display_name = st.text_input("표시 이름")
+            role_label = st.selectbox("권한", ["일반 사용자", "관리자"])
+            temporary_password = st.text_input(
+                "임시 비밀번호",
+                type="password",
+                help="10자 이상이며 영문자와 숫자를 각각 하나 이상 포함해야 합니다.",
+            )
+            temporary_password_confirm = st.text_input(
+                "임시 비밀번호 확인",
+                type="password",
+            )
+            create_submitted = st.form_submit_button(
+                "계정 발급",
+                type="primary",
+                use_container_width=True,
+            )
+        if create_submitted:
+            if temporary_password != temporary_password_confirm:
+                st.error("임시 비밀번호 확인이 일치하지 않습니다.")
+            else:
+                try:
+                    created = store.create_user(
+                        actor_user_id=actor.id,
+                        username=username,
+                        display_name=display_name,
+                        temporary_password=temporary_password,
+                        role=("admin" if role_label == "관리자" else "user"),
+                    )
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    _set_auth_flash(f"{created.username} 계정을 발급했습니다.")
+                    st.rerun()
+
+    with manage_tab:
+        user_by_id = {user.id: user for user in users}
+        selected_user_id = st.selectbox(
+            "대상 계정",
+            options=list(user_by_id),
+            format_func=lambda user_id: (
+                f"{user_by_id[user_id].username} · {user_by_id[user_id].display_name}"
+            ),
+            key="admin_selected_user_id",
+        )
+        selected_user = user_by_id[selected_user_id]
+        selected_role_label = st.selectbox(
+            "권한 변경",
+            ["일반 사용자", "관리자"],
+            index=(1 if selected_user.is_admin else 0),
+            key=f"admin_role_{selected_user.id}",
+        )
+        action_col1, action_col2, action_col3 = st.columns(3)
+        if action_col1.button(
+            "권한 적용",
+            key=f"apply_role_{selected_user.id}",
+            use_container_width=True,
+        ):
+            try:
+                store.set_role(
+                    actor_user_id=actor.id,
+                    target_user_id=selected_user.id,
+                    role=("admin" if selected_role_label == "관리자" else "user"),
+                )
+            except AuthError as exc:
+                st.error(str(exc))
+            else:
+                _set_auth_flash(f"{selected_user.username} 계정의 권한을 변경했습니다.")
+                st.rerun()
+        active_button_label = "계정 비활성화" if selected_user.is_active else "계정 활성화"
+        if action_col2.button(
+            active_button_label,
+            key=f"toggle_active_{selected_user.id}",
+            use_container_width=True,
+        ):
+            try:
+                store.set_active(
+                    actor_user_id=actor.id,
+                    target_user_id=selected_user.id,
+                    is_active=not selected_user.is_active,
+                )
+            except AuthError as exc:
+                st.error(str(exc))
+            else:
+                _set_auth_flash(f"{selected_user.username} 계정 상태를 변경했습니다.")
+                st.rerun()
+        if action_col3.button(
+            "로그인 잠금 해제",
+            key=f"unlock_{selected_user.id}",
+            use_container_width=True,
+        ):
+            try:
+                store.unlock_user(
+                    actor_user_id=actor.id,
+                    target_user_id=selected_user.id,
+                )
+            except AuthError as exc:
+                st.error(str(exc))
+            else:
+                _set_auth_flash(f"{selected_user.username} 계정의 잠금을 해제했습니다.")
+                st.rerun()
+
+        st.markdown("#### 임시 비밀번호 발급")
+        with st.form(f"reset_password_form_{selected_user.id}", clear_on_submit=True):
+            reset_password = st.text_input(
+                "새 임시 비밀번호",
+                type="password",
+                key=f"reset_password_{selected_user.id}",
+            )
+            reset_password_confirm = st.text_input(
+                "새 임시 비밀번호 확인",
+                type="password",
+                key=f"reset_password_confirm_{selected_user.id}",
+            )
+            reset_submitted = st.form_submit_button(
+                "비밀번호 초기화",
+                use_container_width=True,
+            )
+        if reset_submitted:
+            if reset_password != reset_password_confirm:
+                st.error("임시 비밀번호 확인이 일치하지 않습니다.")
+            else:
+                try:
+                    store.reset_password(
+                        actor_user_id=actor.id,
+                        target_user_id=selected_user.id,
+                        temporary_password=reset_password,
+                    )
+                except AuthError as exc:
+                    st.error(str(exc))
+                else:
+                    _set_auth_flash(f"{selected_user.username} 계정의 비밀번호를 초기화했습니다.")
+                    st.rerun()
+
+    with audit_tab:
+        events = store.list_audit_events(actor_user_id=actor.id, limit=100)
+        audit_rows = [
+            {
+                "일시": _format_auth_time(event.created_at),
+                "작업자": event.actor_username,
+                "작업": event.action,
+                "대상": event.target_username,
+                "내용": event.detail,
+            }
+            for event in events
+        ]
+        st.dataframe(
+            pd.DataFrame(audit_rows),
+            hide_index=True,
+            use_container_width=True,
+            height=min(560, 42 + len(audit_rows) * 35),
+        )
+
+
+def _render_auth_sidebar(user: AuthUser) -> None:
+    st.sidebar.divider()
+    role_label = "관리자" if user.is_admin else "일반 사용자"
+    st.sidebar.caption(f"로그인: {user.display_name} · {role_label}")
+    if st.sidebar.button("로그아웃", use_container_width=True):
+        _clear_auth_session()
+        st.rerun()
 
 
 def _parse_watchlist(raw: str) -> tuple[list[WatchSymbol], list[str]]:
@@ -884,19 +1364,32 @@ def _nxt_universe_for_date(status_date: date) -> tuple[
                 stored_statuses,
                 "",
             )
+        return (
+            [],
+            {},
+            {},
+            {},
+            [],
+            "선택한 과거 일자의 NXT 확정 데이터가 로컬 DB에 없습니다.",
+        )
 
-    client = NxtClient(get_response_cache())
-    statuses = client.fetch_trading_status(status_date)
-    symbols, markets, tradable_markets, unavailable_reasons = _universe_metadata(
-        statuses
+    snapshot_date, symbols, markets, tradable_markets, unavailable_reasons, warning = (
+        _latest_nxt_universe()
     )
+    if snapshot_date is None:
+        return [], {}, {}, {}, [], warning
+    statuses = get_kis_nxt_universe_store().load_universe(snapshot_date)
+    if not statuses:
+        _stored_date, statuses = get_historical_market_store().load_latest_nxt_statuses(
+            snapshot_date
+        )
     return (
         symbols,
         markets,
         tradable_markets,
         unavailable_reasons,
         statuses,
-        client.trading_status_fallback_warning,
+        warning,
     )
 
 
@@ -934,46 +1427,71 @@ def _latest_nxt_universe() -> tuple[
     str,
 ]:
     today = pd.Timestamp.now(tz="Asia/Seoul").date()
-    request_error: RequestException | None = None
-    try:
-        (
+    universe_store = get_kis_nxt_universe_store()
+    today_statuses = universe_store.load_universe(today)
+
+    app_key = _secret_value("KIS_APP_KEY")
+    app_secret = _secret_value("KIS_APP_SECRET")
+    sync_status = None
+    if app_key and app_secret:
+        service = get_kis_nxt_universe_sync_service(
+            app_key,
+            app_secret,
+            KIS_UNIVERSE_RUNTIME_VERSION,
+        )
+        if is_nxt_api_collection_window() and not is_nxt_morning_break():
+            service.start_if_needed(today)
+        sync_status = service.status()
+
+    if today_statuses:
+        symbols, markets, tradable_markets, unavailable_reasons = (
+            _universe_metadata(today_statuses)
+        )
+        return (
+            today,
             symbols,
             markets,
             tradable_markets,
             unavailable_reasons,
-            _statuses,
-            warning,
-        ) = _nxt_universe_for_date(today)
-        if symbols:
-            return (
-                today,
-                symbols,
-                markets,
-                tradable_markets,
-                unavailable_reasons,
-                warning,
-            )
-    except RequestException as exc:
-        request_error = exc
-        LOGGER.warning(
-            "NXT current-universe request failed; trying stored history",
-            exc_info=True,
+            "",
         )
 
-    stored_date, stored_statuses = (
-        get_historical_market_store().load_latest_nxt_statuses(today)
-    )
+    stored_date, stored_statuses = universe_store.load_latest_universe(today)
+    source = "KIS 계산"
+    if not stored_statuses:
+        stored_date, stored_statuses = (
+            get_historical_market_store().load_latest_nxt_statuses(today)
+        )
+        source = "확정 일별 DB"
     if stored_date is not None and stored_statuses:
         symbols, markets, tradable_markets, unavailable_reasons = (
             _universe_metadata(stored_statuses)
         )
-        warning = ""
-        if request_error is not None:
+        if sync_status is not None and sync_status.state == "오류":
             warning = (
-                "NXT 공식 사이트 연결에 실패해 "
-                f"{stored_date:%Y-%m-%d}에 저장된 종목 목록을 사용합니다. "
-                "장중 가격은 계속 갱신되지만 거래가능시장과 거래불가사유는 "
-                "저장일 기준일 수 있습니다."
+                "당일 KIS 종목 대상 계산에 실패해 "
+                f"{stored_date:%Y-%m-%d} {source} 종목 목록을 사용합니다. "
+                f"오류: {sync_status.message}"
+            )
+        elif sync_status is not None and sync_status.state == "계산중":
+            warning = (
+                "KIS 마스터와 NXT 시세로 당일 종목 대상을 계산 중입니다. "
+                f"완료 전까지 {stored_date:%Y-%m-%d} {source} 목록을 사용합니다."
+            )
+        elif not app_key or not app_secret:
+            warning = (
+                "KIS 인증정보가 없어 당일 종목 대상을 갱신하지 못했습니다. "
+                f"{stored_date:%Y-%m-%d} {source} 목록을 사용합니다."
+            )
+        elif is_nxt_morning_break():
+            warning = (
+                "NXT 휴장 구간(08:50~09:00)에는 대상종목 계산을 중지합니다. "
+                f"{stored_date:%Y-%m-%d} {source} 목록을 사용합니다."
+            )
+        else:
+            warning = (
+                f"현재 자동 수집시간(08:00~20:05) 밖이라 {stored_date:%Y-%m-%d} "
+                f"{source} 목록을 사용합니다."
             )
         return (
             stored_date,
@@ -984,45 +1502,14 @@ def _latest_nxt_universe() -> tuple[
             warning,
         )
 
-    # 새 로컬 환경처럼 DB가 아직 비어 있고 오늘 응답만 빈 경우에는 기존과
-    # 같이 최근 7일을 확인합니다. 연결 실패가 확인된 경우에는 반복 호출하지 않습니다.
-    if request_error is None:
-        for days_ago in range(1, 8):
-            status_date = today - timedelta(days=days_ago)
-            try:
-                (
-                    symbols,
-                    markets,
-                    tradable_markets,
-                    unavailable_reasons,
-                    _statuses,
-                    warning,
-                ) = _nxt_universe_for_date(status_date)
-            except RequestException as exc:
-                LOGGER.warning(
-                    "NXT fallback-universe request failed for %s",
-                    status_date,
-                    exc_info=True,
-                )
-                request_error = exc
-                break
-            if symbols:
-                return (
-                    status_date,
-                    symbols,
-                    markets,
-                    tradable_markets,
-                    unavailable_reasons,
-                    warning,
-                )
-
-    warning = (
-        "NXT 공식 사이트에 연결할 수 없고 저장된 종목 목록도 없습니다. "
-        "잠시 후 다시 시도해 주세요."
-        if request_error is not None
-        else ""
+    return (
+        None,
+        [],
+        {},
+        {},
+        {},
+        "KIS 종목 대상 DB가 비어 있습니다. 로컬 동기화 작업을 먼저 실행해 주세요.",
     )
-    return None, [], {}, {}, {}, warning
 
 
 def _render_universe_counts(
@@ -1171,9 +1658,13 @@ def _render_rest_universe_table(
     markets: dict[str, str],
     tradable_markets: dict[str, str],
     unavailable_reasons: dict[str, str],
+    websocket_collector: KisRealtimeCollector | None = None,
 ) -> None:
     collector.heartbeat()
     status = collector.status()
+    websocket_status = (
+        websocket_collector.status() if websocket_collector is not None else None
+    )
     status_items = [
         ("API 상태", status.state),
         ("갱신 진행", f"{status.completed_count:,} / {status.universe_count:,}"),
@@ -1187,6 +1678,10 @@ def _render_rest_universe_table(
         (
             "실제 소요시간",
             f"{status.cycle_seconds:.1f}초" if status.cycle_seconds is not None else "대기",
+        ),
+        (
+            "WebSocket",
+            websocket_status.state if websocket_status is not None else "운영시간 외",
         ),
     ]
     status_html = "".join(
@@ -1366,6 +1861,8 @@ def _render_rest_universe_table(
     )
     if status.state == "오류":
         st.warning(status.message)
+    if websocket_status is not None and websocket_status.state == "오류":
+        st.warning(f"KIS WebSocket: {websocket_status.message}")
     _render_dashboard_notices(historical=False)
 
 
@@ -1705,31 +2202,22 @@ def rest_universe_page() -> None:
                 historical_unavailable_reasons,
             ) = _universe_metadata(historical_statuses)
         else:
-            try:
-                with st.spinner(
-                    f"{selected_date:%Y-%m-%d} 데이터를 최초 1회 DB에 저장하고 있습니다..."
-                ):
-                    (
-                        historical_symbols,
-                        historical_markets,
-                        historical_tradable_markets,
-                        historical_unavailable_reasons,
-                        historical_statuses,
-                        _historical_warning,
-                    ) = _nxt_universe_for_date(selected_date)
-            except RequestException:
-                LOGGER.warning(
-                    "NXT historical-universe request failed for %s",
-                    selected_date,
-                    exc_info=True,
-                )
-                st.warning(
-                    "선택한 일자의 NXT 데이터가 DB에 없고 공식 사이트에도 "
-                    "연결할 수 없습니다. 잠시 후 다시 시도해 주세요."
-                )
-                return
+            with st.spinner(
+                f"{selected_date:%Y-%m-%d} DB 데이터를 확인하고 있습니다..."
+            ):
+                (
+                    historical_symbols,
+                    historical_markets,
+                    historical_tradable_markets,
+                    historical_unavailable_reasons,
+                    historical_statuses,
+                    _historical_warning,
+                ) = _nxt_universe_for_date(selected_date)
             if not historical_symbols:
-                st.warning("선택한 일자에는 NXT 정규시장 데이터가 없습니다.")
+                st.warning(
+                    "선택한 일자의 NXT 확정 데이터가 DB에 없습니다. "
+                    "로컬 일일 저장 작업으로 먼저 적재해 주세요."
+                )
                 return
             krx_key = _secret_value("KRX_KEY")
             if not krx_key:
@@ -1785,6 +2273,28 @@ def rest_universe_page() -> None:
         get_rest_universe_runtime.clear()
         st.rerun()
     collector.start(symbols, REST_UNIVERSE_REFRESH_SECONDS)
+    websocket_collector: KisRealtimeCollector | None = None
+    _websocket_aggregator, websocket_collector = get_universe_websocket_runtime(
+        app_key,
+        app_secret,
+        KIS_UNIVERSE_RUNTIME_VERSION,
+    )
+    if is_nxt_api_collection_window() and not is_nxt_morning_break():
+        anchor_statuses = get_kis_nxt_universe_store().load_universe(today)
+        if not anchor_statuses:
+            _anchor_date, anchor_statuses = (
+                get_historical_market_store().load_latest_nxt_statuses(today)
+            )
+        anchor_codes = {item.symbol for item in symbols}
+        anchors = [
+            WatchSymbol(item.stock_code, item.stock_name or item.stock_code)
+            for item in select_websocket_anchor_symbols(anchor_statuses)
+            if item.stock_code in anchor_codes
+        ]
+        if anchors:
+            websocket_collector.start(anchors)
+    else:
+        websocket_collector.stop()
     _render_rest_index_cards(collector, unavailable_reasons)
 
     _render_rest_universe_table(
@@ -1793,6 +2303,7 @@ def rest_universe_page() -> None:
         markets,
         tradable_markets,
         unavailable_reasons,
+        websocket_collector,
     )
 
 
@@ -3264,13 +3775,25 @@ def load_nxt_trading_statuses(
     end_date: date,
     force_refresh: bool = False,
 ):
-    client = NxtClient(get_response_cache())
-    statuses = client.fetch_trading_status_range(
-        start_date,
-        end_date,
-        force_refresh=force_refresh,
-    )
-    return statuses, client.ssl_fallback_used
+    # NXT 홈페이지는 로컬 대사 스크립트에서만 조회한다. Streamlit 화면은
+    # 확정 일별 DB와 당일 KIS 계산 DB를 읽어 동시 사용자 수와 무관하게
+    # NXT 공식 사이트 호출량을 0으로 유지한다.
+    _ = force_refresh
+    history = get_historical_market_store()
+    kis_store = get_kis_nxt_universe_store()
+    today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    statuses_by_date: dict[date, list[NxtTradingStatus]] = {}
+    cursor = start_date
+    while cursor <= end_date:
+        rows = (
+            kis_store.load_universe(cursor)
+            if cursor == today
+            else history.load_nxt_statuses(cursor)
+        )
+        if rows:
+            statuses_by_date[cursor] = rows
+        cursor += timedelta(days=1)
+    return statuses_by_date, False
 
 
 def load_kind_disclosures(
@@ -4004,6 +4527,26 @@ def krx_market_actions_page() -> None:
 
 
 def main() -> None:
+    try:
+        auth_store = get_auth_store()
+    except AuthConfigurationError as exc:
+        st.error("인증용 PostgreSQL에 연결하지 못해 로그인을 시작할 수 없습니다.")
+        st.code(str(exc), language=None)
+        st.caption(
+            "AUTH_DATABASE_URL과 PostgreSQL 접속 허용 IP·SSL 설정을 확인한 뒤 앱을 다시 시작하세요."
+        )
+        return
+    if not auth_store.has_users():
+        _render_initial_admin_setup()
+        return
+    auth_user = _current_auth_user()
+    if auth_user is None:
+        _render_login_page()
+        return
+    if auth_user.must_change_password:
+        _render_forced_password_change(auth_user)
+        return
+    _show_auth_flash()
     get_nxt_change_scheduler().start()
     pages = [
         st.Page(
@@ -4020,8 +4563,14 @@ def main() -> None:
         st.Page(nxt_changes_page, title="NXT 정규시장 종목 변동내역", icon="🔄"),
         st.Page(market_history_page, title="NXT·KRX 일별 거래 추이", icon="📈"),
         st.Page(disclosure_page, title="KRX 시장조치 조회", icon="📋"),
+        st.Page(my_account_page, title="내 계정", icon="🔐"),
     ]
+    if auth_user.is_admin:
+        pages.append(
+            st.Page(user_management_page, title="사용자 관리", icon="👥")
+        )
     navigation = st.navigation(pages)
+    _render_auth_sidebar(auth_user)
     navigation.run()
 
 

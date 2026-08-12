@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from datetime import date
 
-import requests
-
 import app
 from src.models import NxtTradingStatus
 
@@ -23,9 +21,6 @@ def test_latest_nxt_universe_falls_back_to_stored_statuses(
         )
     ]
 
-    def fail_current_request(_status_date: date) -> object:
-        raise requests.ConnectionError("temporary failure")
-
     class StoredHistory:
         def load_latest_nxt_statuses(
             self,
@@ -33,8 +28,19 @@ def test_latest_nxt_universe_falls_back_to_stored_statuses(
         ) -> tuple[date, list[NxtTradingStatus]]:
             return stored_date, stored_statuses
 
-    monkeypatch.setattr(app, "_nxt_universe_for_date", fail_current_request)  # type: ignore[attr-defined]
+    class EmptyKisStore:
+        def load_universe(self, _status_date: date) -> list[NxtTradingStatus]:
+            return []
+
+        def load_latest_universe(
+            self,
+            _on_or_before: date,
+        ) -> tuple[None, list[NxtTradingStatus]]:
+            return None, []
+
     monkeypatch.setattr(app, "get_historical_market_store", StoredHistory)  # type: ignore[attr-defined]
+    monkeypatch.setattr(app, "get_kis_nxt_universe_store", EmptyKisStore)  # type: ignore[attr-defined]
+    monkeypatch.setattr(app, "_secret_value", lambda _name: "")  # type: ignore[attr-defined]
 
     (
         resolved_date,
@@ -50,4 +56,4 @@ def test_latest_nxt_universe_falls_back_to_stored_statuses(
     assert markets == {"005930": "KOSPI"}
     assert tradable_markets == {"005930": "NXT"}
     assert unavailable_reasons == {"005930": ""}
-    assert "저장된 종목 목록" in warning
+    assert "확정 일별 DB" in warning

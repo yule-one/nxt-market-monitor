@@ -151,6 +151,13 @@ class KisRealtimeCollector:
         with self._lock:
             if self._ws:
                 self._ws.close()
+            thread = self._thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=5)
         self.aggregator.flush()
 
     def status(self) -> CollectorStatus:
