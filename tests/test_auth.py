@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,94 @@ def test_admin_issues_account_and_user_must_change_password(tmp_path: Path) -> N
     assert changed is not None
     assert not changed.must_change_password
     assert store.authenticate(user.username, STRONG_PASSWORD) is None
+
+
+def test_signup_requires_admin_approval_before_login(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    admin = make_admin(store)
+    applicant = store.request_signup(
+        username="applicant01",
+        employee_number="E00123",
+        display_name="신청자",
+        password=STRONG_PASSWORD,
+    )
+
+    assert applicant.approval_status == "pending"
+    assert applicant.employee_number == "E00123"
+    assert not applicant.is_active
+    pending_login = store.authenticate_with_status(
+        applicant.username,
+        STRONG_PASSWORD,
+    )
+    assert pending_login.user is None
+    assert pending_login.status == "pending"
+    assert [user.id for user in store.list_signup_requests(actor_user_id=admin.id)] == [
+        applicant.id
+    ]
+
+    approved = store.review_signup_request(
+        actor_user_id=admin.id,
+        target_user_id=applicant.id,
+        approve=True,
+    )
+
+    assert approved.approval_status == "approved"
+    assert approved.is_active
+    assert approved.decision_by == admin.username
+    authenticated = store.authenticate(applicant.username, STRONG_PASSWORD)
+    assert authenticated is not None
+    assert not authenticated.must_change_password
+
+
+def test_rejected_signup_cannot_login_and_keeps_reason(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    admin = make_admin(store)
+    applicant = store.request_signup(
+        username="applicant02",
+        employee_number="e00124",
+        display_name="반려 대상",
+        password=STRONG_PASSWORD,
+    )
+
+    rejected = store.review_signup_request(
+        actor_user_id=admin.id,
+        target_user_id=applicant.id,
+        approve=False,
+        rejection_reason="사번을 확인해 주세요.",
+    )
+    result = store.authenticate_with_status(applicant.username, STRONG_PASSWORD)
+
+    assert rejected.approval_status == "rejected"
+    assert not rejected.is_active
+    assert result.user is None
+    assert result.status == "rejected"
+    assert result.rejection_reason == "사번을 확인해 주세요."
+
+
+def test_signup_rejects_duplicate_username_and_employee_number(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    make_admin(store)
+    store.request_signup(
+        username="applicant03",
+        employee_number="E00125",
+        display_name="첫 신청자",
+        password=STRONG_PASSWORD,
+    )
+
+    with pytest.raises(AuthError, match="아이디"):
+        store.request_signup(
+            username="applicant03",
+            employee_number="E00126",
+            display_name="중복 아이디",
+            password=STRONG_PASSWORD,
+        )
+    with pytest.raises(AuthError, match="사번"):
+        store.request_signup(
+            username="applicant04",
+            employee_number="e00125",
+            display_name="중복 사번",
+            password=STRONG_PASSWORD,
+        )
 
 
 def test_failed_logins_lock_account_until_admin_unlocks_it(tmp_path: Path) -> None:
@@ -173,6 +262,46 @@ def test_deactivated_account_cannot_login_and_actions_are_audited(tmp_path: Path
 def test_auth_store_rejects_non_postgresql_database_url() -> None:
     with pytest.raises(AuthConfigurationError, match="postgresql://"):
         AuthStore(database_url="sqlite:///auth.db")
+
+
+def test_existing_auth_database_is_upgraded_as_approved(tmp_path: Path) -> None:
+    database_path = tmp_path / "legacy-auth.db"
+    password_hash = hash_password(STRONG_PASSWORD)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE app_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                must_change_password INTEGER NOT NULL DEFAULT 1,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO app_users (
+                username, display_name, password_hash, role, is_active,
+                must_change_password, created_at, updated_at
+            ) VALUES ('admin', '관리자', ?, 'admin', 1, 0, ?, ?)
+            """,
+            (password_hash, "2026-08-12T00:00:00+00:00", "2026-08-12T00:00:00+00:00"),
+        )
+
+    store = AuthStore(database_path)
+    user = store.authenticate("admin", STRONG_PASSWORD)
+
+    assert user is not None
+    assert user.approval_status == "approved"
+    assert user.employee_number is None
 
 
 def test_sqlite_accounts_and_audit_log_can_be_migrated(tmp_path: Path) -> None:

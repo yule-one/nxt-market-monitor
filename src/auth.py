@@ -27,6 +27,8 @@ MAX_FAILED_ATTEMPTS = 5
 LOCK_MINUTES = 15
 USERNAME_PATTERN = re.compile(r"^[a-z0-9._-]{3,32}$")
 VALID_ROLES = {"admin", "user"}
+VALID_APPROVAL_STATUSES = {"pending", "approved", "rejected"}
+EMPLOYEE_NUMBER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{2,30}$")
 
 
 class AuthError(ValueError):
@@ -47,6 +49,8 @@ class AuthUser:
     username: str
     display_name: str
     role: str
+    employee_number: str | None
+    approval_status: str
     is_active: bool
     must_change_password: bool
     failed_attempts: int
@@ -54,10 +58,25 @@ class AuthUser:
     created_at: datetime
     updated_at: datetime
     last_login_at: datetime | None
+    signup_requested_at: datetime | None
+    decision_at: datetime | None
+    decision_by: str | None
+    rejection_reason: str | None
 
     @property
     def is_admin(self) -> bool:
         return self.role == "admin"
+
+    @property
+    def is_approved(self) -> bool:
+        return self.approval_status == "approved"
+
+
+@dataclass(frozen=True)
+class AuthenticationResult:
+    user: AuthUser | None
+    status: str
+    rejection_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,13 +103,20 @@ SQLITE_SCHEMA_STATEMENTS = (
         display_name TEXT NOT NULL,
         password_hash TEXT NOT NULL,
         role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+        employee_number TEXT COLLATE NOCASE,
+        approval_status TEXT NOT NULL DEFAULT 'approved'
+            CHECK (approval_status IN ('pending', 'approved', 'rejected')),
         is_active INTEGER NOT NULL DEFAULT 1,
         must_change_password INTEGER NOT NULL DEFAULT 1,
         failed_attempts INTEGER NOT NULL DEFAULT 0,
         locked_until TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        last_login_at TEXT
+        last_login_at TEXT,
+        signup_requested_at TEXT,
+        decision_at TEXT,
+        decision_by TEXT,
+        rejection_reason TEXT
     )
     """,
     """
@@ -118,13 +144,20 @@ POSTGRES_SCHEMA_STATEMENTS = (
         display_name VARCHAR(50) NOT NULL,
         password_hash TEXT NOT NULL,
         role VARCHAR(16) NOT NULL CHECK (role IN ('admin', 'user')),
+        employee_number VARCHAR(30),
+        approval_status VARCHAR(16) NOT NULL DEFAULT 'approved'
+            CHECK (approval_status IN ('pending', 'approved', 'rejected')),
         is_active BOOLEAN NOT NULL DEFAULT TRUE,
         must_change_password BOOLEAN NOT NULL DEFAULT TRUE,
         failed_attempts INTEGER NOT NULL DEFAULT 0,
         locked_until TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL,
-        last_login_at TIMESTAMPTZ
+        last_login_at TIMESTAMPTZ,
+        signup_requested_at TIMESTAMPTZ,
+        decision_at TIMESTAMPTZ,
+        decision_by VARCHAR(32),
+        rejection_reason VARCHAR(500)
     )
     """,
     """
@@ -182,6 +215,13 @@ def validate_display_name(display_name: str) -> str:
     normalized = " ".join(str(display_name or "").split())
     if not 1 <= len(normalized) <= 50:
         raise AuthError("표시 이름은 1~50자로 입력하세요.")
+    return normalized
+
+
+def normalize_employee_number(employee_number: str) -> str:
+    normalized = str(employee_number or "").strip().upper()
+    if not EMPLOYEE_NUMBER_PATTERN.fullmatch(normalized):
+        raise AuthError("사번은 영문자·숫자·밑줄·하이픈 2~30자로 입력하세요.")
     return normalized
 
 
@@ -301,6 +341,57 @@ class AuthStore:
                 schema_statements = POSTGRES_SCHEMA_STATEMENTS
             for statement in schema_statements:
                 connection.execute(statement)
+            self._ensure_signup_columns(connection)
+
+    def _ensure_signup_columns(self, connection: _ConnectionAdapter) -> None:
+        """Add registration fields without invalidating previously issued accounts."""
+        if self.backend_name == "sqlite":
+            existing_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(app_users)").fetchall()
+            }
+            sqlite_additions = {
+                "employee_number": "employee_number TEXT COLLATE NOCASE",
+                "approval_status": (
+                    "approval_status TEXT NOT NULL DEFAULT 'approved'"
+                ),
+                "signup_requested_at": "signup_requested_at TEXT",
+                "decision_at": "decision_at TEXT",
+                "decision_by": "decision_by TEXT",
+                "rejection_reason": "rejection_reason TEXT",
+            }
+            for column_name, definition in sqlite_additions.items():
+                if column_name not in existing_columns:
+                    connection.execute(
+                        f"ALTER TABLE app_users ADD COLUMN {definition}"
+                    )
+        else:
+            postgres_additions = (
+                "ADD COLUMN IF NOT EXISTS employee_number VARCHAR(30)",
+                (
+                    "ADD COLUMN IF NOT EXISTS approval_status VARCHAR(16) "
+                    "NOT NULL DEFAULT 'approved'"
+                ),
+                "ADD COLUMN IF NOT EXISTS signup_requested_at TIMESTAMPTZ",
+                "ADD COLUMN IF NOT EXISTS decision_at TIMESTAMPTZ",
+                "ADD COLUMN IF NOT EXISTS decision_by VARCHAR(32)",
+                "ADD COLUMN IF NOT EXISTS rejection_reason VARCHAR(500)",
+            )
+            for addition in postgres_additions:
+                connection.execute(f"ALTER TABLE app_users {addition}")
+        connection.execute(
+            """
+            UPDATE app_users
+            SET approval_status = 'approved'
+            WHERE approval_status IS NULL OR approval_status = ''
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_app_users_employee_number
+            ON app_users(employee_number)
+            """
+        )
 
     @staticmethod
     def _now() -> datetime:
@@ -331,6 +422,10 @@ class AuthStore:
             username=str(row["username"]),
             display_name=str(row["display_name"]),
             role=str(row["role"]),
+            employee_number=(
+                str(row["employee_number"]) if row["employee_number"] else None
+            ),
+            approval_status=str(row["approval_status"] or "approved"),
             is_active=bool(row["is_active"]),
             must_change_password=bool(row["must_change_password"]),
             failed_attempts=int(row["failed_attempts"]),
@@ -338,6 +433,12 @@ class AuthStore:
             created_at=cls._parse_time(row["created_at"]) or cls._now(),
             updated_at=cls._parse_time(row["updated_at"]) or cls._now(),
             last_login_at=cls._parse_time(row["last_login_at"]),
+            signup_requested_at=cls._parse_time(row["signup_requested_at"]),
+            decision_at=cls._parse_time(row["decision_at"]),
+            decision_by=(str(row["decision_by"]) if row["decision_by"] else None),
+            rejection_reason=(
+                str(row["rejection_reason"]) if row["rejection_reason"] else None
+            ),
         )
 
     @classmethod
@@ -384,14 +485,24 @@ class AuthStore:
             "SELECT * FROM app_users WHERE id = ?",
             (int(actor_user_id),),
         ).fetchone()
-        if actor is None or not bool(actor["is_active"]) or actor["role"] != "admin":
+        if (
+            actor is None
+            or not bool(actor["is_active"])
+            or actor["role"] != "admin"
+            or str(actor["approval_status"]) != "approved"
+        ):
             raise AuthError("관리자 권한이 필요합니다.")
         return actor
 
     @staticmethod
     def _active_admin_count(connection: _ConnectionAdapter) -> int:
         row = connection.execute(
-            "SELECT COUNT(*) AS count FROM app_users WHERE role = 'admin' AND is_active = TRUE"
+            """
+            SELECT COUNT(*) AS count
+            FROM app_users
+            WHERE role = 'admin' AND is_active = TRUE
+              AND approval_status = 'approved'
+            """
         ).fetchone()
         return int(row["count"] if row else 0)
 
@@ -422,8 +533,9 @@ class AuthStore:
                 """
                 INSERT INTO app_users (
                     username, display_name, password_hash, role, is_active,
-                    must_change_password, created_at, updated_at
-                ) VALUES (?, ?, ?, 'admin', ?, ?, ?, ?)
+                    must_change_password, approval_status, decision_at,
+                    decision_by, created_at, updated_at
+                ) VALUES (?, ?, ?, 'admin', ?, ?, 'approved', ?, ?, ?, ?)
                 RETURNING id
                 """,
                 (
@@ -432,6 +544,8 @@ class AuthStore:
                     password_hash,
                     True,
                     False,
+                    now,
+                    normalized_username,
                     now,
                     now,
                 ),
@@ -469,11 +583,15 @@ class AuthStore:
             ).fetchall()
         return [self._user_from_row(row) for row in rows]
 
-    def authenticate(self, username: str, password: str) -> AuthUser | None:
+    def authenticate_with_status(
+        self,
+        username: str,
+        password: str,
+    ) -> AuthenticationResult:
         try:
             normalized_username = normalize_username(username)
         except AuthError:
-            return None
+            return AuthenticationResult(None, "invalid_credentials")
         now = self._now()
         now_text = self._serialize_time(now)
         with self._lock, self._connect() as connection:
@@ -481,11 +599,11 @@ class AuthStore:
                 "SELECT * FROM app_users WHERE username = ?",
                 (normalized_username,),
             ).fetchone()
-            if row is None or not bool(row["is_active"]):
-                return None
+            if row is None:
+                return AuthenticationResult(None, "invalid_credentials")
             locked_until = self._parse_time(row["locked_until"])
             if locked_until is not None and locked_until > now:
-                return None
+                return AuthenticationResult(None, "locked")
             if not verify_password(password, str(row["password_hash"])):
                 failed_attempts = int(row["failed_attempts"]) + 1
                 next_locked_until: str | None = None
@@ -508,7 +626,27 @@ class AuthStore:
                     target_username=normalized_username,
                     detail=("ACCOUNT_LOCKED" if next_locked_until else "INVALID_PASSWORD"),
                 )
-                return None
+                return AuthenticationResult(None, "invalid_credentials")
+            approval_status = str(row["approval_status"] or "approved")
+            if approval_status != "approved":
+                self._write_audit(
+                    connection,
+                    actor_username=normalized_username,
+                    action="LOGIN_BLOCKED",
+                    target_username=normalized_username,
+                    detail=f"approval_status={approval_status}",
+                )
+                return AuthenticationResult(
+                    None,
+                    approval_status,
+                    (
+                        str(row["rejection_reason"])
+                        if row["rejection_reason"]
+                        else None
+                    ),
+                )
+            if not bool(row["is_active"]):
+                return AuthenticationResult(None, "inactive")
             connection.execute(
                 """
                 UPDATE app_users
@@ -528,7 +666,159 @@ class AuthStore:
                 "SELECT * FROM app_users WHERE id = ?",
                 (int(row["id"]),),
             ).fetchone()
-        return self._user_from_row(updated) if updated is not None else None
+        return AuthenticationResult(
+            self._user_from_row(updated) if updated is not None else None,
+            "success",
+        )
+
+    def authenticate(self, username: str, password: str) -> AuthUser | None:
+        return self.authenticate_with_status(username, password).user
+
+    def request_signup(
+        self,
+        *,
+        username: str,
+        employee_number: str,
+        display_name: str,
+        password: str,
+    ) -> AuthUser:
+        normalized_username = normalize_username(username)
+        normalized_employee_number = normalize_employee_number(employee_number)
+        normalized_display_name = validate_display_name(display_name)
+        password_hash = hash_password(password)
+        now = self._serialize_time(self._now())
+        with self._lock, self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM app_users WHERE username = ?",
+                (normalized_username,),
+            ).fetchone():
+                raise AuthError("이미 사용 중이거나 신청된 아이디입니다.")
+            if connection.execute(
+                "SELECT 1 FROM app_users WHERE employee_number = ?",
+                (normalized_employee_number,),
+            ).fetchone():
+                raise AuthError("이미 등록되거나 신청된 사번입니다.")
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO app_users (
+                        username, display_name, password_hash, role,
+                        employee_number, approval_status, is_active,
+                        must_change_password, signup_requested_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, 'user', ?, 'pending', ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    (
+                        normalized_username,
+                        normalized_display_name,
+                        password_hash,
+                        normalized_employee_number,
+                        False,
+                        False,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+            except Exception as exc:
+                if self._is_unique_violation(exc):
+                    raise AuthError("이미 등록되거나 신청된 아이디 또는 사번입니다.") from exc
+                raise
+            inserted = cursor.fetchone()
+            if inserted is None:
+                raise AuthError("회원가입 신청 번호를 확인하지 못했습니다.")
+            user_id = int(inserted["id"])
+            self._write_audit(
+                connection,
+                actor_username=normalized_username,
+                action="SIGNUP_REQUESTED",
+                target_username=normalized_username,
+            )
+            row = connection.execute(
+                "SELECT * FROM app_users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            raise AuthError("회원가입 신청 내역을 확인하지 못했습니다.")
+        return self._user_from_row(row)
+
+    def list_signup_requests(
+        self,
+        *,
+        actor_user_id: int,
+        status: str = "pending",
+    ) -> list[AuthUser]:
+        normalized_status = str(status).strip().lower()
+        if normalized_status not in VALID_APPROVAL_STATUSES:
+            raise AuthError("지원하지 않는 승인 상태입니다.")
+        with self._connect() as connection:
+            self._require_admin(connection, actor_user_id)
+            rows = connection.execute(
+                """
+                SELECT * FROM app_users
+                WHERE approval_status = ?
+                ORDER BY signup_requested_at, username
+                """,
+                (normalized_status,),
+            ).fetchall()
+        return [self._user_from_row(row) for row in rows]
+
+    def review_signup_request(
+        self,
+        *,
+        actor_user_id: int,
+        target_user_id: int,
+        approve: bool,
+        rejection_reason: str = "",
+    ) -> AuthUser:
+        normalized_reason = " ".join(str(rejection_reason or "").split())
+        if len(normalized_reason) > 500:
+            raise AuthError("반려 사유는 500자 이하로 입력하세요.")
+        with self._lock, self._connect() as connection:
+            actor = self._require_admin(connection, actor_user_id)
+            target = connection.execute(
+                "SELECT * FROM app_users WHERE id = ?",
+                (int(target_user_id),),
+            ).fetchone()
+            if target is None:
+                raise AuthError("회원가입 신청을 찾을 수 없습니다.")
+            if str(target["approval_status"]) != "pending":
+                raise AuthError("이미 처리된 회원가입 신청입니다.")
+            next_status = "approved" if approve else "rejected"
+            now = self._serialize_time(self._now())
+            connection.execute(
+                """
+                UPDATE app_users
+                SET approval_status = ?, is_active = ?, decision_at = ?,
+                    decision_by = ?, rejection_reason = ?,
+                    failed_attempts = 0, locked_until = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    next_status,
+                    bool(approve),
+                    now,
+                    str(actor["username"]),
+                    (None if approve else normalized_reason or None),
+                    now,
+                    int(target_user_id),
+                ),
+            )
+            self._write_audit(
+                connection,
+                actor_username=str(actor["username"]),
+                action=("SIGNUP_APPROVED" if approve else "SIGNUP_REJECTED"),
+                target_username=str(target["username"]),
+                detail=("" if approve else normalized_reason),
+            )
+            updated = connection.execute(
+                "SELECT * FROM app_users WHERE id = ?",
+                (int(target_user_id),),
+            ).fetchone()
+        if updated is None:
+            raise AuthError("처리한 회원가입 신청을 확인하지 못했습니다.")
+        return self._user_from_row(updated)
 
     def create_user(
         self,
@@ -553,8 +843,9 @@ class AuthStore:
                     """
                     INSERT INTO app_users (
                         username, display_name, password_hash, role, is_active,
-                        must_change_password, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        must_change_password, approval_status, decision_at,
+                        decision_by, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?, ?)
                     RETURNING id
                     """,
                     (
@@ -564,6 +855,8 @@ class AuthStore:
                         normalized_role,
                         True,
                         True,
+                        now,
+                        str(actor["username"]),
                         now,
                         now,
                     ),
@@ -643,6 +936,8 @@ class AuthStore:
             ).fetchone()
             if target is None:
                 raise AuthError("대상 계정을 찾을 수 없습니다.")
+            if str(target["approval_status"]) != "approved":
+                raise AuthError("승인 완료된 계정만 비밀번호를 초기화할 수 있습니다.")
             now = self._serialize_time(self._now())
             connection.execute(
                 """
@@ -675,6 +970,8 @@ class AuthStore:
             ).fetchone()
             if target is None:
                 raise AuthError("대상 계정을 찾을 수 없습니다.")
+            if is_active and str(target["approval_status"]) != "approved":
+                raise AuthError("승인 완료된 계정만 활성화할 수 있습니다.")
             if not is_active and int(target["id"]) == int(actor_user_id):
                 raise AuthError("현재 로그인한 관리자 계정은 비활성화할 수 없습니다.")
             if (
@@ -719,6 +1016,8 @@ class AuthStore:
             ).fetchone()
             if target is None:
                 raise AuthError("대상 계정을 찾을 수 없습니다.")
+            if str(target["approval_status"]) != "approved":
+                raise AuthError("승인 완료된 계정만 권한을 변경할 수 있습니다.")
             if (
                 target["role"] == "admin"
                 and normalized_role != "admin"
@@ -753,6 +1052,8 @@ class AuthStore:
             ).fetchone()
             if target is None:
                 raise AuthError("대상 계정을 찾을 수 없습니다.")
+            if str(target["approval_status"]) != "approved":
+                raise AuthError("승인 완료된 계정만 잠금을 해제할 수 있습니다.")
             now = self._serialize_time(self._now())
             connection.execute(
                 """
@@ -806,6 +1107,12 @@ class AuthStore:
             }
             if "app_users" not in table_names:
                 raise AuthError("원본 DB에 app_users 테이블이 없습니다.")
+            source_user_columns = {
+                str(row["name"])
+                for row in source_connection.execute(
+                    "PRAGMA table_info(app_users)"
+                ).fetchall()
+            }
             source_users = source_connection.execute(
                 "SELECT * FROM app_users ORDER BY id"
             ).fetchall()
@@ -831,7 +1138,14 @@ class AuthStore:
             if not password_hash.startswith(f"{PASSWORD_SCHEME}$"):
                 raise AuthError(f"지원하지 않는 비밀번호 해시입니다: {username}")
             is_active = bool(row["is_active"])
-            if role == "admin" and is_active:
+            approval_status = (
+                str(row["approval_status"])
+                if "approval_status" in source_user_columns
+                else "approved"
+            )
+            if approval_status not in VALID_APPROVAL_STATUSES:
+                raise AuthError(f"지원하지 않는 승인 상태가 있습니다: {username}")
+            if role == "admin" and is_active and approval_status == "approved":
                 active_admins += 1
             normalized_users.append(
                 {
@@ -839,6 +1153,12 @@ class AuthStore:
                     "display_name": display_name,
                     "password_hash": password_hash,
                     "role": role,
+                    "employee_number": (
+                        row["employee_number"]
+                        if "employee_number" in source_user_columns
+                        else None
+                    ),
+                    "approval_status": approval_status,
                     "is_active": is_active,
                     "must_change_password": bool(row["must_change_password"]),
                     "failed_attempts": int(row["failed_attempts"]),
@@ -846,6 +1166,26 @@ class AuthStore:
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                     "last_login_at": row["last_login_at"],
+                    "signup_requested_at": (
+                        row["signup_requested_at"]
+                        if "signup_requested_at" in source_user_columns
+                        else None
+                    ),
+                    "decision_at": (
+                        row["decision_at"]
+                        if "decision_at" in source_user_columns
+                        else None
+                    ),
+                    "decision_by": (
+                        row["decision_by"]
+                        if "decision_by" in source_user_columns
+                        else None
+                    ),
+                    "rejection_reason": (
+                        row["rejection_reason"]
+                        if "rejection_reason" in source_user_columns
+                        else None
+                    ),
                 }
             )
         if active_admins < 1:
@@ -862,16 +1202,21 @@ class AuthStore:
                 destination.execute(
                     """
                     INSERT INTO app_users (
-                        username, display_name, password_hash, role, is_active,
+                        username, display_name, password_hash, role,
+                        employee_number, approval_status, is_active,
                         must_change_password, failed_attempts, locked_until,
-                        created_at, updated_at, last_login_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        created_at, updated_at, last_login_at,
+                        signup_requested_at, decision_at, decision_by,
+                        rejection_reason
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["username"],
                         row["display_name"],
                         row["password_hash"],
                         row["role"],
+                        row["employee_number"],
+                        row["approval_status"],
                         row["is_active"],
                         row["must_change_password"],
                         row["failed_attempts"],
@@ -879,6 +1224,10 @@ class AuthStore:
                         row["created_at"],
                         row["updated_at"],
                         row["last_login_at"],
+                        row["signup_requested_at"],
+                        row["decision_at"],
+                        row["decision_by"],
+                        row["rejection_reason"],
                     ),
                 )
             for row in source_audit_events:
