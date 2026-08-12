@@ -149,6 +149,78 @@ def test_rejected_signup_cannot_login_and_keeps_reason(tmp_path: Path) -> None:
     assert result.rejection_reason == "사번을 확인해 주세요."
 
 
+def test_admin_can_delete_only_rejected_signup_and_reuse_identifiers(
+    tmp_path: Path,
+) -> None:
+    store = make_store(tmp_path)
+    admin = make_admin(store)
+    applicant = store.request_signup(
+        username="applicant-delete",
+        employee_number="E00999",
+        display_name="삭제 대상",
+        password=STRONG_PASSWORD,
+    )
+
+    with pytest.raises(AuthError, match="반려된"):
+        store.delete_rejected_signup(
+            actor_user_id=admin.id,
+            target_user_id=applicant.id,
+        )
+
+    store.review_signup_request(
+        actor_user_id=admin.id,
+        target_user_id=applicant.id,
+        approve=False,
+        rejection_reason="재신청 필요",
+    )
+    store.delete_rejected_signup(
+        actor_user_id=admin.id,
+        target_user_id=applicant.id,
+    )
+
+    assert store.get_user(applicant.id) is None
+    recreated = store.request_signup(
+        username="applicant-delete",
+        employee_number="e00999",
+        display_name="재신청자",
+        password=NEW_PASSWORD,
+    )
+    assert recreated.approval_status == "pending"
+    actions = [
+        event.action
+        for event in store.list_audit_events(actor_user_id=admin.id, limit=20)
+    ]
+    assert "REJECTED_SIGNUP_DELETED" in actions
+
+
+def test_non_admin_cannot_delete_rejected_signup(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    admin = make_admin(store)
+    user = store.create_user(
+        actor_user_id=admin.id,
+        username="ordinary-user",
+        display_name="일반 사용자",
+        temporary_password=STRONG_PASSWORD,
+    )
+    applicant = store.request_signup(
+        username="rejected-user",
+        employee_number="E00888",
+        display_name="반려 사용자",
+        password=STRONG_PASSWORD,
+    )
+    store.review_signup_request(
+        actor_user_id=admin.id,
+        target_user_id=applicant.id,
+        approve=False,
+    )
+
+    with pytest.raises(AuthError, match="관리자 권한"):
+        store.delete_rejected_signup(
+            actor_user_id=user.id,
+            target_user_id=applicant.id,
+        )
+
+
 def test_signup_rejects_duplicate_username_and_employee_number(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     make_admin(store)

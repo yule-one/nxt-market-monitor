@@ -820,6 +820,34 @@ class AuthStore:
             raise AuthError("처리한 회원가입 신청을 확인하지 못했습니다.")
         return self._user_from_row(updated)
 
+    def delete_rejected_signup(
+        self,
+        *,
+        actor_user_id: int,
+        target_user_id: int,
+    ) -> None:
+        with self._lock, self._connect() as connection:
+            actor = self._require_admin(connection, actor_user_id)
+            target = connection.execute(
+                "SELECT * FROM app_users WHERE id = ?",
+                (int(target_user_id),),
+            ).fetchone()
+            if target is None:
+                raise AuthError("삭제할 반려 계정을 찾을 수 없습니다.")
+            if str(target["approval_status"]) != "rejected":
+                raise AuthError("반려된 회원가입 계정만 삭제할 수 있습니다.")
+            target_username = str(target["username"])
+            connection.execute(
+                "DELETE FROM app_users WHERE id = ?",
+                (int(target_user_id),),
+            )
+            self._write_audit(
+                connection,
+                actor_username=str(actor["username"]),
+                action="REJECTED_SIGNUP_DELETED",
+                target_username=target_username,
+            )
+
     def create_user(
         self,
         *,
