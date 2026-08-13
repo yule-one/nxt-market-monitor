@@ -18,6 +18,10 @@ KRX_STOCK_PATHS = {
     "KOSPI": "/sto/stk_bydd_trd",
     "KOSDAQ": "/sto/ksq_bydd_trd",
 }
+KRX_STOCK_BASIC_PATHS = {
+    "KOSPI": "/sto/stk_isu_base_info",
+    "KOSDAQ": "/sto/ksq_isu_base_info",
+}
 KRX_INDEX_PATHS = {
     "KRX TMI": ("/idx/krx_dd_trd", "KRX TMI"),
     "KOSPI": ("/idx/kospi_dd_trd", "코스피"),
@@ -41,6 +45,23 @@ class KrxDailySnapshot:
     future_quotes: dict[str, FutureQuote] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class KrxListedSecurityDaily:
+    trade_date: date
+    standard_code: str
+    short_code: str
+    stock_name: str
+    market: str
+    stock_type: str
+    security_type: str
+    listed_shares: int
+    listing_date: date | None
+    cumulative_volume: int
+    cumulative_amount: int
+    is_kospi200: bool = False
+    is_kosdaq150: bool = False
+
+
 def _integer(value: object) -> int:
     raw = str(value or "0").replace(",", "").strip()
     try:
@@ -55,6 +76,16 @@ def _decimal(value: object) -> float:
         return float(raw or "0")
     except ValueError:
         return 0.0
+
+
+def _date_value(value: object) -> date | None:
+    raw = re.sub(r"[^0-9]", "", str(value or ""))
+    if len(raw) != 8:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y%m%d").date()
+    except ValueError:
+        return None
 
 
 class KrxOpenApiClient:
@@ -141,6 +172,82 @@ class KrxOpenApiClient:
                 if shares > 0:
                     listed_shares[symbol] = shares
         return quotes, listed_shares
+
+    def fetch_listed_securities(
+        self,
+        trading_date: date,
+        *,
+        force_refresh: bool = False,
+    ) -> list[KrxListedSecurityDaily]:
+        """KOSPI·KOSDAQ 전 주권의 일별 거래정보와 종목기본정보를 결합합니다."""
+
+        daily_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        for market, path in KRX_STOCK_PATHS.items():
+            for raw in self._fetch_rows(
+                path,
+                trading_date,
+                force_refresh=force_refresh,
+            ):
+                short_code = normalize_stock_code(raw.get("ISU_CD"))
+                if short_code:
+                    daily_rows[(market, short_code)] = raw
+
+        records: list[KrxListedSecurityDaily] = []
+        matched_keys: set[tuple[str, str]] = set()
+        for market, path in KRX_STOCK_BASIC_PATHS.items():
+            basic_rows = self._fetch_rows(
+                path,
+                trading_date,
+                force_refresh=force_refresh,
+            )
+            for raw in basic_rows:
+                short_code = normalize_stock_code(raw.get("ISU_SRT_CD"))
+                standard_code = str(raw.get("ISU_CD") or "").strip()
+                if not short_code or not standard_code:
+                    continue
+                daily = daily_rows.get((market, short_code))
+                if daily is None:
+                    continue
+                matched_keys.add((market, short_code))
+                records.append(
+                    KrxListedSecurityDaily(
+                        trade_date=trading_date,
+                        standard_code=standard_code,
+                        short_code=short_code,
+                        stock_name=str(
+                            raw.get("ISU_ABBRV")
+                            or daily.get("ISU_NM")
+                            or short_code
+                        ).strip(),
+                        market=str(raw.get("MKT_TP_NM") or market).strip(),
+                        stock_type=str(
+                            raw.get("KIND_STKCERT_TP_NM") or "미분류"
+                        ).strip(),
+                        security_type=str(
+                            raw.get("SECUGRP_NM") or "미분류"
+                        ).strip(),
+                        listed_shares=(
+                            _integer(daily.get("LIST_SHRS"))
+                            or _integer(raw.get("LIST_SHRS"))
+                        ),
+                        listing_date=_date_value(raw.get("LIST_DD")),
+                        cumulative_volume=_integer(daily.get("ACC_TRDVOL")),
+                        cumulative_amount=_integer(daily.get("ACC_TRDVAL")),
+                    )
+                )
+
+        unmatched = sorted(set(daily_rows) - matched_keys)
+        if unmatched:
+            preview = ", ".join(f"{market}:{code}" for market, code in unmatched[:5])
+            raise KrxOpenApiError(
+                f"{trading_date:%Y-%m-%d} KRX 종목기본정보와 결합하지 못한 "
+                f"일별 종목이 {len(unmatched):,}개입니다: {preview}"
+            )
+        if not records:
+            raise KrxOpenApiError(
+                f"{trading_date:%Y-%m-%d} KRX KOSPI·KOSDAQ 종목 데이터가 없습니다."
+            )
+        return sorted(records, key=lambda item: (item.market, item.short_code))
 
     def fetch_index_quotes(
         self,

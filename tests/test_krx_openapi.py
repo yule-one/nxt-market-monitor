@@ -31,6 +31,25 @@ class FakeSession:
 
     def get(self, url: str, **kwargs: object) -> FakeResponse:
         self.calls.append((url, kwargs))
+        if "stk_isu_base_info" in url:
+            return FakeResponse(
+                {
+                    "OutBlock_1": [
+                        {
+                            "ISU_CD": "KR7005930003",
+                            "ISU_SRT_CD": "005930",
+                            "ISU_ABBRV": "삼성전자",
+                            "MKT_TP_NM": "KOSPI",
+                            "KIND_STKCERT_TP_NM": "보통주",
+                            "SECUGRP_NM": "주권",
+                            "LIST_SHRS": "5969782550",
+                            "LIST_DD": "19750611",
+                        }
+                    ]
+                }
+            )
+        if "ksq_isu_base_info" in url:
+            return FakeResponse({"OutBlock_1": []})
         if "fut_bydd_trd" in url:
             return FakeResponse(
                 {
@@ -214,3 +233,28 @@ def test_krx_openapi_reuses_cached_rows() -> None:
     client.fetch_index_quotes(date(2026, 8, 5))
 
     assert len(session.calls) == first_call_count
+
+
+def test_krx_openapi_joins_daily_trade_and_security_basic_information() -> None:
+    session = FakeSession()
+    client = KrxOpenApiClient(
+        "secret-key",
+        FakeCache(),  # type: ignore[arg-type]
+        session=session,
+        base_url="https://example.test",
+    )
+
+    records = client.fetch_listed_securities(date(2026, 8, 5))
+
+    assert len(records) == 1
+    item = records[0]
+    assert item.standard_code == "KR7005930003"
+    assert item.short_code == "005930"
+    assert item.stock_name == "삼성전자"
+    assert item.market == "KOSPI"
+    assert item.stock_type == "보통주"
+    assert item.security_type == "주권"
+    assert item.listed_shares == 5_969_782_550
+    assert item.listing_date == date(1975, 6, 11)
+    assert item.cumulative_volume == 123_456
+    assert item.cumulative_amount == 8_765_432_100

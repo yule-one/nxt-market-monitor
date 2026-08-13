@@ -30,7 +30,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Save previous-day NXT/KRX/TMI, KOSPI200 futures, USD-KRW, and NXT pre-market OHLC at 08:00; retry up to 10 times every minute" `
+    -Description "Save previous-day NXT/KRX all listed stocks/TMI, KOSPI200 futures, USD-KRW, and NXT pre-market OHLC at 08:00; retry up to 10 times every minute" `
     -Force | Out-Null
 
 $task = Get-ScheduledTask -TaskName $TaskName

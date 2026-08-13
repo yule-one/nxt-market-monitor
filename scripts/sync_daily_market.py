@@ -19,6 +19,7 @@ from src.kind_client import KindClient
 from src.kis_rest import KisRestClient
 from src.kis_websocket import KisCredentials
 from src.krx_openapi import KrxOpenApiClient
+from src.krx_listed_history import KrxListedHistoryStore, apply_index_memberships
 from src.krx_index_constituents import (
     KRX_INDEX_SPECS,
     KrxIndexConstituentClient,
@@ -204,6 +205,56 @@ def _sync_krx_index_constituents(
     )
 
 
+def _sync_krx_listed_history(
+    history_store: HistoricalMarketStore,
+    listed_store: KrxListedHistoryStore,
+    auth_key: str,
+    end_date: date,
+    logger: logging.Logger,
+) -> None:
+    """일일 작업에서는 기존 DB의 마지막 거래일 이후 누락분만 증분 저장합니다."""
+
+    final_dates = [
+        item.trade_date
+        for item in history_store.list_metrics(NXT_LAUNCH_DATE, end_date)
+        if item.is_final
+    ]
+    if not final_dates:
+        return
+    existing_dates = listed_store.dates()
+    if existing_dates:
+        target_dates = [item for item in final_dates if item > existing_dates[-1]]
+    else:
+        # 최초 전체 적재는 별도 백필 스크립트가 담당합니다. 일일 작업이 과거 수백
+        # 거래일을 한꺼번에 호출하지 않도록 최신 확정 거래일만 우선 저장합니다.
+        target_dates = [final_dates[-1]]
+    if not target_dates:
+        return
+
+    client = KrxOpenApiClient(auth_key, persist_raw_cache=False)
+    for trading_date in target_dates:
+        memberships = history_store.index_constituent_codes(trading_date)
+        counts = {name: len(codes) for name, codes in memberships.items()}
+        if not (
+            190 <= counts.get("KOSPI200", 0) <= 205
+            and 145 <= counts.get("KOSDAQ150", 0) <= 155
+        ):
+            raise RuntimeError(
+                f"{trading_date:%Y-%m-%d} 지수 구성종목 이력 불완전: {counts}"
+            )
+        records = client.fetch_listed_securities(
+            trading_date,
+            force_refresh=True,
+        )
+        records = apply_index_memberships(records, memberships)
+        stored = listed_store.replace_daily(records)
+        logger.info(
+            "%s KRX 전 상장종목 저장 완료: %s종목",
+            trading_date,
+            stored,
+        )
+
+
 def _target_date(now: datetime) -> date:
     """Return the previous Korean calendar day for the 08:00 daily job."""
     local_now = now.astimezone(KST)
@@ -215,6 +266,7 @@ def main() -> int:
     now = datetime.now(KST)
     target_date = _target_date(now)
     store = HistoricalMarketStore()
+    listed_store = KrxListedHistoryStore()
     latest_final = store.latest_final_date()
     start_date = (
         max(NXT_LAUNCH_DATE, latest_final + timedelta(days=1))
@@ -250,6 +302,17 @@ def main() -> int:
             _sync_krx_index_constituents(store, target_date, logger)
         except Exception:
             logger.exception("KRX 지수 구성종목 동기화 실패: 목표=%s", target_date)
+        try:
+            _sync_krx_listed_history(
+                store,
+                listed_store,
+                _krx_key(),
+                target_date,
+                logger,
+            )
+        except Exception:
+            logger.exception("KRX 전 상장종목 동기화 실패: 목표=%s", target_date)
+            return 1
         try:
             _sync_nxt_unavailability_kind_links(
                 store,
@@ -309,6 +372,13 @@ def main() -> int:
             _sync_krx_index_constituents(store, target_date, logger)
         except Exception:
             logger.exception("KRX 지수 구성종목 동기화 실패: 목표=%s", target_date)
+        _sync_krx_listed_history(
+            store,
+            listed_store,
+            auth_key,
+            target_date,
+            logger,
+        )
         try:
             _sync_nxt_unavailability_kind_links(
                 store,

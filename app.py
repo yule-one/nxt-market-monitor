@@ -8,6 +8,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from html import escape
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -43,7 +44,13 @@ from src.historical_market import (
     monthly_six_month_volume_ratios,
     six_calendar_month_window_start,
 )
-from src.krx_openapi import KrxDailySnapshot, KrxOpenApiClient, KrxOpenApiError
+from src.krx_openapi import (
+    KrxDailySnapshot,
+    KrxListedSecurityDaily,
+    KrxOpenApiClient,
+    KrxOpenApiError,
+)
+from src.krx_listed_history import KrxListedHistoryStore
 from src.kis_rest import (
     IndexQuote,
     KisRestClient,
@@ -90,6 +97,7 @@ SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 12
 HISTORICAL_STORE_RUNTIME_VERSION = 15
+KRX_LISTED_STORE_RUNTIME_VERSION = 1
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 5
 KIS_UNIVERSE_RUNTIME_VERSION = 1
@@ -446,6 +454,18 @@ def get_historical_market_store() -> HistoricalMarketStore:
         _get_historical_market_store.clear()
         store = _get_historical_market_store(HISTORICAL_STORE_RUNTIME_VERSION)
     return store
+
+
+@st.cache_resource
+def _get_krx_listed_history_store(
+    runtime_version: int,
+) -> KrxListedHistoryStore:
+    _ = runtime_version
+    return KrxListedHistoryStore()
+
+
+def get_krx_listed_history_store() -> KrxListedHistoryStore:
+    return _get_krx_listed_history_store(KRX_LISTED_STORE_RUNTIME_VERSION)
 
 
 @st.cache_resource
@@ -3053,6 +3073,224 @@ def market_history_page() -> None:
     _render_history_market_charts(frame)
 
 
+def _krx_listed_daily_frame(
+    records: list[KrxListedSecurityDaily],
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "표준코드": item.standard_code,
+                "단축코드": item.short_code,
+                "종목명": item.stock_name,
+                "시장구분": item.market,
+                "주식종류": item.stock_type,
+                "증권구분": item.security_type,
+                "상장주식수": item.listed_shares,
+                "상장일": item.listing_date,
+                "KRX 거래량": item.cumulative_volume,
+                "KRX 거래대금": item.cumulative_amount,
+                "K200": "Y" if item.is_kospi200 else "-",
+                "Q150": "Y" if item.is_kosdaq150 else "-",
+            }
+            for item in records
+        ]
+    )
+
+
+def _krx_listed_excel_bytes(frame: pd.DataFrame, trading_date: date) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        frame.to_excel(writer, sheet_name=f"KRX_{trading_date:%Y%m%d}", index=False)
+        worksheet = writer.book[f"KRX_{trading_date:%Y%m%d}"]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        widths = {
+            "A": 16,
+            "B": 12,
+            "C": 24,
+            "D": 12,
+            "E": 14,
+            "F": 14,
+            "G": 18,
+            "H": 13,
+            "I": 18,
+            "J": 22,
+            "K": 10,
+            "L": 10,
+        }
+        for column, width in widths.items():
+            worksheet.column_dimensions[column].width = width
+        for row in range(2, worksheet.max_row + 1):
+            worksheet[f"H{row}"].number_format = "yyyy-mm-dd"
+            for column in ("G", "I", "J"):
+                worksheet[f"{column}{row}"].number_format = "#,##0"
+    return output.getvalue()
+
+
+def krx_listed_history_page() -> None:
+    st.title("KRX 전체 상장종목 일별 거래현황")
+    store = get_krx_listed_history_store()
+    available_dates = store.dates()
+    if not available_dates:
+        st.warning(
+            "저장된 KRX 전 상장종목 데이터가 없습니다. "
+            "scripts/backfill_krx_listed_history.py를 먼저 실행하세요."
+        )
+        return
+
+    coverage = store.coverage()
+    selected_date = st.selectbox(
+        "조회일",
+        options=list(reversed(available_dates)),
+        format_func=lambda value: value.strftime("%Y-%m-%d"),
+        key="krx_listed_history_date",
+    )
+    records = store.load_daily(selected_date)
+    frame = _krx_listed_daily_frame(records)
+    if frame.empty:
+        st.info("선택일에 저장된 종목이 없습니다.")
+        return
+
+    st.caption(
+        f"DB 수록 {coverage.first_date:%Y-%m-%d}~{coverage.last_date:%Y-%m-%d} · "
+        f"{coverage.trading_days:,}거래일 · {coverage.rows:,}행 · "
+        "한국거래소 통계정보"
+    )
+
+    filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    markets = sorted(frame["시장구분"].dropna().unique().tolist())
+    selected_markets = filter_col1.multiselect(
+        "시장구분",
+        options=markets,
+        default=markets,
+        key="krx_listed_market_filter",
+    )
+    stock_types = sorted(frame["주식종류"].dropna().unique().tolist())
+    selected_stock_type = filter_col2.selectbox(
+        "주식종류",
+        options=["전체", *stock_types],
+        key="krx_listed_stock_type_filter",
+    )
+    security_types = sorted(frame["증권구분"].dropna().unique().tolist())
+    selected_security_type = filter_col3.selectbox(
+        "증권구분",
+        options=["전체", *security_types],
+        key="krx_listed_security_type_filter",
+    )
+    selected_index = filter_col4.selectbox(
+        "지수 구성",
+        options=["전체", "K200", "Q150", "K200 또는 Q150"],
+        key="krx_listed_index_filter",
+    )
+    keyword_col, sort_col = st.columns([3, 1])
+    keyword = keyword_col.text_input(
+        "종목 검색",
+        placeholder="표준코드·단축코드·종목명",
+        key="krx_listed_keyword_filter",
+    ).strip()
+    sort_column = sort_col.selectbox(
+        "정렬기준",
+        options=["KRX 거래대금", "KRX 거래량", "상장주식수", "단축코드"],
+        key="krx_listed_sort_column",
+    )
+
+    filtered = frame.copy()
+    filtered = filtered[filtered["시장구분"].isin(selected_markets)]
+    if selected_stock_type != "전체":
+        filtered = filtered[filtered["주식종류"] == selected_stock_type]
+    if selected_security_type != "전체":
+        filtered = filtered[filtered["증권구분"] == selected_security_type]
+    if selected_index == "K200":
+        filtered = filtered[filtered["K200"] == "Y"]
+    elif selected_index == "Q150":
+        filtered = filtered[filtered["Q150"] == "Y"]
+    elif selected_index == "K200 또는 Q150":
+        filtered = filtered[(filtered["K200"] == "Y") | (filtered["Q150"] == "Y")]
+    if keyword:
+        keyword_mask = (
+            filtered["표준코드"].str.contains(keyword, case=False, regex=False, na=False)
+            | filtered["단축코드"].str.contains(keyword, case=False, regex=False, na=False)
+            | filtered["종목명"].str.contains(keyword, case=False, regex=False, na=False)
+        )
+        filtered = filtered[keyword_mask]
+    filtered = filtered.sort_values(
+        sort_column,
+        ascending=sort_column == "단축코드",
+        kind="stable",
+    )
+
+    total_volume = int(filtered["KRX 거래량"].sum()) if not filtered.empty else 0
+    total_amount = int(filtered["KRX 거래대금"].sum()) if not filtered.empty else 0
+    summary_columns = st.columns(6)
+    summary_columns[0].metric("조회 종목수", f"{len(filtered):,}")
+    summary_columns[1].metric(
+        "KOSPI 종목수",
+        f"{int((filtered['시장구분'] == 'KOSPI').sum()):,}",
+    )
+    summary_columns[2].metric(
+        "KOSDAQ 종목수",
+        f"{int((filtered['시장구분'] == 'KOSDAQ').sum()):,}",
+    )
+    summary_columns[3].metric("KRX 거래량", _format_volume(total_volume))
+    summary_columns[4].metric("KRX 거래대금", _format_amount(total_amount))
+    summary_columns[5].metric(
+        "K200 / Q150",
+        f"{int((filtered['K200'] == 'Y').sum()):,} / "
+        f"{int((filtered['Q150'] == 'Y').sum()):,}",
+    )
+
+    table = (
+        filtered.style.format(
+            {
+                "상장주식수": lambda value: f"{int(value):,}",
+                "상장일": lambda value: (
+                    value.strftime("%Y-%m-%d") if not pd.isna(value) else "-"
+                ),
+                "KRX 거래량": lambda value: f"{int(value):,}",
+                "KRX 거래대금": lambda value: f"{int(value):,}",
+            }
+        )
+        .set_properties(
+            subset=["표준코드", "단축코드", "시장구분", "주식종류", "증권구분", "상장일", "K200", "Q150"],
+            **{"text-align": "center"},
+        )
+        .set_properties(subset=["종목명"], **{"text-align": "left"})
+        .set_properties(
+            subset=["상장주식수", "KRX 거래량", "KRX 거래대금"],
+            **{"text-align": "right"},
+        )
+        .set_table_styles(
+            [{"selector": "th.col_heading", "props": [("text-align", "center")]}],
+            overwrite=False,
+        )
+    )
+    st.dataframe(table, hide_index=True, use_container_width=True, height=720)
+    st.download_button(
+        "조회 결과 Excel 다운로드",
+        data=_krx_listed_excel_bytes(filtered, selected_date),
+        file_name=f"KRX_전체상장종목_{selected_date:%Y%m%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    _render_notice_items(
+        [
+            "이 화면은 외부 API를 직접 호출하지 않고 별도 SQLite DB에 저장된 확정 일별 값만 조회합니다.",
+            (
+                "대상은 KRX OPEN API의 KOSPI·KOSDAQ 주식 일별매매정보와 종목기본정보에 "
+                "수록된 종목이며 코넥스·ETF·ETN·ELW는 제외합니다."
+            ),
+            (
+                "KRX 거래량·거래대금은 해당 종목의 거래소 확정 일별 값입니다. "
+                "정규시장과 시간외시장 거래가 합산될 수 있습니다."
+            ),
+            (
+                "K200·Q150은 KRX 공식 구성종목과 변경내역으로 복원한 조회일 기준 "
+                "코스피200·코스닥150 편입 여부입니다."
+            ),
+        ]
+    )
+
+
 NXT_LIMIT_COLUMNS = [
     "종목코드",
     "종목명",
@@ -4940,6 +5178,11 @@ def main() -> None:
         ),
         st.Page(nxt_changes_page, title="NXT 정규시장 종목 변동내역", icon="🔄"),
         st.Page(market_history_page, title="NXT·KRX 일별 거래 추이", icon="📈"),
+        st.Page(
+            krx_listed_history_page,
+            title="KRX 전체 상장종목 일별 거래현황",
+            icon="🏛️",
+        ),
         st.Page(disclosure_page, title="KRX 시장조치 조회", icon="📋"),
         st.Page(my_account_page, title="내 계정", icon="🔐"),
     ]
