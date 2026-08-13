@@ -99,7 +99,7 @@ LOGGER = logging.getLogger(__name__)
 SHOW_CHARTS = False
 REST_UNIVERSE_REFRESH_SECONDS = 10
 REST_UNIVERSE_RUNTIME_VERSION = 12
-HISTORICAL_STORE_RUNTIME_VERSION = 15
+HISTORICAL_STORE_RUNTIME_VERSION = 16
 KRX_LISTED_STORE_RUNTIME_VERSION = 1
 NXT_CHANGE_STORE_RUNTIME_VERSION = 2
 KIS_SHARED_CLIENT_RUNTIME_VERSION = 5
@@ -432,16 +432,32 @@ def get_auth_store() -> AuthStore:
 
 
 @st.cache_resource
-def _get_historical_market_store(runtime_version: int) -> HistoricalMarketStore:
+def _get_historical_market_store(
+    runtime_version: int,
+    seed_token: tuple[int, int],
+) -> HistoricalMarketStore:
     # Include the persisted-model schema in Streamlit's cache key.  Otherwise a
     # hot reload can retain an instance created before a new snapshot field or
     # store method was added.
-    _ = runtime_version
+    _ = runtime_version, seed_token
     return HistoricalMarketStore()
 
 
+def _seed_cache_token(file_name: str) -> tuple[int, int]:
+    seed_path = Path(__file__).resolve().parent / "data" / file_name
+    try:
+        stat = seed_path.stat()
+    except OSError:
+        return (0, 0)
+    return (int(stat.st_size), int(stat.st_mtime_ns))
+
+
 def get_historical_market_store() -> HistoricalMarketStore:
-    store = _get_historical_market_store(HISTORICAL_STORE_RUNTIME_VERSION)
+    seed_token = _seed_cache_token("history.db.gz")
+    store = _get_historical_market_store(
+        HISTORICAL_STORE_RUNTIME_VERSION,
+        seed_token,
+    )
     if not all(
         hasattr(store, method_name)
         for method_name in (
@@ -455,30 +471,45 @@ def get_historical_market_store() -> HistoricalMarketStore:
         )
     ):
         _get_historical_market_store.clear()
-        store = _get_historical_market_store(HISTORICAL_STORE_RUNTIME_VERSION)
+        store = _get_historical_market_store(
+            HISTORICAL_STORE_RUNTIME_VERSION,
+            seed_token,
+        )
     return store
 
 
 @st.cache_resource
 def _get_krx_listed_history_store(
     runtime_version: int,
+    seed_token: tuple[int, int],
 ) -> KrxListedHistoryStore:
-    _ = runtime_version
+    _ = runtime_version, seed_token
     return KrxListedHistoryStore()
 
 
 def get_krx_listed_history_store() -> KrxListedHistoryStore:
-    return _get_krx_listed_history_store(KRX_LISTED_STORE_RUNTIME_VERSION)
+    return _get_krx_listed_history_store(
+        KRX_LISTED_STORE_RUNTIME_VERSION,
+        _seed_cache_token("krx_listed_history.db.gz"),
+    )
 
 
 @st.cache_resource
-def _get_nxt_change_store(runtime_version: int) -> NxtChangeStore:
-    _ = runtime_version
+def _get_nxt_change_store(
+    runtime_version: int,
+    seed_token: tuple[int, int],
+) -> NxtChangeStore:
+    _ = runtime_version, seed_token
     return NxtChangeStore()
 
 
 def get_nxt_change_store() -> NxtChangeStore:
-    return _get_nxt_change_store(NXT_CHANGE_STORE_RUNTIME_VERSION)
+    # 변동내역도 history.db를 공유하므로 먼저 최신 압축 시드 복원을 보장합니다.
+    get_historical_market_store()
+    return _get_nxt_change_store(
+        NXT_CHANGE_STORE_RUNTIME_VERSION,
+        _seed_cache_token("history.db.gz"),
+    )
 
 
 @st.cache_resource

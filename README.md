@@ -86,7 +86,7 @@ streamlit run app.py
 
 앱은 과거일 대시보드 데이터를 `data/history.db`에 날짜·종목 단위로 정규화해 저장합니다. NXT 공식 종목행, NXT 대상 종목의 KRX 확정행, 지수행, 일별 합계를 저장하므로 같은 과거일을 다시 볼 때 API를 호출하지 않습니다. KOSPI·KOSDAQ 전 상장종목의 일별 거래정보와 종목속성은 용량과 조회 목적을 분리하기 위해 `data/krx_listed_history.db`에 별도로 저장합니다. 공시·원본 응답 캐시는 `data/cache.db`, 당일 수집 상태는 `data/kis_market.db`, KIS 계산 대상종목과 NXT 공식 대사 결과는 `data/kis_universe.db`를 사용합니다.
 
-배포 저장소에는 확정 과거 데이터의 `data/history.db.gz`, `data/krx_listed_history.db.gz`와 KIS 대상종목의 `data/kis_universe.db.gz` 압축 시드를 포함할 수 있습니다. 새 Streamlit 인스턴스에서 원본 DB가 없으면 시드를 자동 복원합니다. `cache.db`, `kis_market.db`, `kis_universe_ws.db`는 재생성 가능한 캐시·장중 상태이므로 Git에 포함하지 않습니다. 실행 중 추가된 DB 변경은 컨테이너 재시작 시 유지되지 않으므로 시드는 필요할 때 다시 생성해 Git에 반영해야 합니다.
+배포 저장소에는 확정 과거 데이터의 `data/history.db.gz`, `data/krx_listed_history.db.gz`와 KIS 대상종목의 `data/kis_universe.db.gz` 압축 시드를 포함할 수 있습니다. 새 Streamlit 인스턴스에서 원본 DB가 없으면 시드를 자동 복원합니다. 시드가 갱신되면 파일 식별값과 확정 거래일을 기존 실행 DB와 대조해 누락된 거래일이 있는 실행 DB도 최신 시드로 교체합니다. `cache.db`, `kis_market.db`, `kis_universe_ws.db`는 재생성 가능한 캐시·장중 상태이므로 Git에 포함하지 않습니다. 실행 중 추가된 DB 변경은 컨테이너 재시작 시 유지되지 않으므로 시드는 필요할 때 다시 생성해 Git에 반영해야 합니다.
 
 ### KIS 기준 NXT 대상종목·로컬 NXT 대사
 
