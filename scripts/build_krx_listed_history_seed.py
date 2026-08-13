@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import argparse
+import gzip
+import os
+import shutil
+import sqlite3
+import tempfile
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="krx_listed_history.db의 일관된 압축 배포 시드를 생성합니다."
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "krx_listed_history.db",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "krx_listed_history.db.gz",
+    )
+    args = parser.parse_args()
+    source_path = args.source.resolve()
+    output_path = args.output.resolve()
+    if not source_path.exists():
+        parser.error(f"원본 DB가 없습니다: {source_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    compressed_path: Path | None = None
+    with tempfile.TemporaryDirectory(prefix="krx-listed-seed-") as temporary_directory:
+        snapshot_path = Path(temporary_directory) / "krx_listed_history.db"
+        source = sqlite3.connect(source_path, timeout=30)
+        target = sqlite3.connect(snapshot_path, timeout=30)
+        try:
+            source.backup(target)
+            target.execute("VACUUM")
+            integrity = str(target.execute("PRAGMA integrity_check").fetchone()[0])
+            if integrity != "ok":
+                raise RuntimeError(f"DB 무결성 검사 실패: {integrity}")
+        finally:
+            target.close()
+            source.close()
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=output_path.parent,
+                prefix=".krx-listed-seed-",
+                suffix=".db.gz",
+                delete=False,
+            ) as temporary_output:
+                compressed_path = Path(temporary_output.name)
+                with snapshot_path.open("rb") as source_file:
+                    with gzip.GzipFile(
+                        filename="krx_listed_history.db",
+                        mode="wb",
+                        fileobj=temporary_output,
+                        mtime=0,
+                    ) as compressed_file:
+                        shutil.copyfileobj(source_file, compressed_file)
+            os.replace(compressed_path, output_path)
+            compressed_path = None
+        finally:
+            if compressed_path is not None:
+                compressed_path.unlink(missing_ok=True)
+
+    print(
+        f"KRX 전 상장종목 seed 생성 완료: {output_path} "
+        f"({output_path.stat().st_size:,} bytes)"
+    )
+
+
+if __name__ == "__main__":
+    main()

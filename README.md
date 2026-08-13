@@ -84,9 +84,9 @@ streamlit run app.py
 
 `AUTH_DATABASE_URL`이 설정되면 계정과 감사기록을 PostgreSQL에 영구 저장하고, 설정하지 않은 로컬 개발환경에서는 `data/auth.db`를 사용합니다. 비밀번호 원문은 저장하지 않으며 로컬 DB는 Git 제외 대상입니다. 기존 SQLite 계정은 `python scripts\migrate_auth_to_postgres.py`로 빈 PostgreSQL에 이전할 수 있습니다. 자세한 설정과 이전 방법은 [로그인·사용자 관리 안내](docs/authentication.md)를 참고하세요.
 
-앱은 과거일 대시보드 데이터를 `data/history.db`에 날짜·종목 단위로 정규화해 저장합니다. NXT 공식 종목행, NXT 대상 종목의 KRX 확정행, 4개 지수행, 일별 합계를 저장하므로 같은 과거일을 다시 볼 때 API를 호출하지 않습니다. 공시·원본 응답 캐시는 `data/cache.db`, 당일 수집 상태는 `data/kis_market.db`, KIS 계산 대상종목과 NXT 공식 대사 결과는 `data/kis_universe.db`를 사용합니다.
+앱은 과거일 대시보드 데이터를 `data/history.db`에 날짜·종목 단위로 정규화해 저장합니다. NXT 공식 종목행, NXT 대상 종목의 KRX 확정행, 지수행, 일별 합계를 저장하므로 같은 과거일을 다시 볼 때 API를 호출하지 않습니다. KOSPI·KOSDAQ 전 상장종목의 일별 거래정보와 종목속성은 용량과 조회 목적을 분리하기 위해 `data/krx_listed_history.db`에 별도로 저장합니다. 공시·원본 응답 캐시는 `data/cache.db`, 당일 수집 상태는 `data/kis_market.db`, KIS 계산 대상종목과 NXT 공식 대사 결과는 `data/kis_universe.db`를 사용합니다.
 
-배포 저장소에는 확정 과거 데이터의 `data/history.db.gz`와 KIS 대상종목의 `data/kis_universe.db.gz` 압축 시드를 포함할 수 있습니다. 새 Streamlit 인스턴스에서 원본 DB가 없으면 시드를 자동 복원합니다. `cache.db`, `kis_market.db`, `kis_universe_ws.db`는 재생성 가능한 캐시·장중 상태이므로 Git에 포함하지 않습니다. 실행 중 추가된 DB 변경은 컨테이너 재시작 시 유지되지 않으므로 시드는 필요할 때 다시 생성해 Git에 반영해야 합니다.
+배포 저장소에는 확정 과거 데이터의 `data/history.db.gz`, `data/krx_listed_history.db.gz`와 KIS 대상종목의 `data/kis_universe.db.gz` 압축 시드를 포함할 수 있습니다. 새 Streamlit 인스턴스에서 원본 DB가 없으면 시드를 자동 복원합니다. `cache.db`, `kis_market.db`, `kis_universe_ws.db`는 재생성 가능한 캐시·장중 상태이므로 Git에 포함하지 않습니다. 실행 중 추가된 DB 변경은 컨테이너 재시작 시 유지되지 않으므로 시드는 필요할 때 다시 생성해 Git에 반영해야 합니다.
 
 ### KIS 기준 NXT 대상종목·로컬 NXT 대사
 
@@ -110,10 +110,21 @@ powershell -ExecutionPolicy Bypass -File scripts\register_nxt_universe_reconcili
 ```powershell
 python scripts\backfill_market_history.py --start 2025-03-04 --end 2026-08-06 --workers 4
 python scripts\backfill_krx_index_constituents.py --start 2025-03-04
+python scripts\backfill_krx_listed_history.py --start 2025-03-04 --workers 4
 python scripts\build_history_seed.py
+python scripts\build_krx_listed_history_seed.py
 ```
 
-KRX 전체 종목 원본을 날짜마다 중복 보관하지 않고, 대시보드에 필요한 NXT 대상 종목만 `history.db`에 저장합니다. KRX API 응답 자체는 백필 과정에서 영구 캐시하지 않아 DB 용량 증가를 제한합니다.
+KRX 전체 종목은 전용 DB에 표준코드·단축코드·종목명·시장·주식종류·증권구분·상장주식수·상장일·거래량·거래대금·K200/Q150 편입 여부를 거래일별로 저장합니다. KRX API 원본 JSON은 영구 캐시하지 않습니다.
+
+### KRX 전체 상장종목 일별 거래현황
+
+KRX OPEN API의 유가증권·코스닥 일별매매정보와 종목기본정보를 단축코드로 결합합니다. 코넥스와 ETF·ETN·ELW는 제외하며, KOSPI200·KOSDAQ150 편입 여부는 `history.db`의 일자별 공식 구성종목 이력으로 보강합니다. Streamlit 페이지는 외부 API를 호출하지 않고 `krx_listed_history.db`만 읽습니다.
+
+```powershell
+python scripts\backfill_krx_listed_history.py --start 2025-03-04 --workers 4
+python scripts\build_krx_listed_history_seed.py
+```
 
 ### NXT 종목 변동내역 자동 적재
 
@@ -186,7 +197,7 @@ python scripts\backfill_nxt_premarket.py --start 2026-08-06 --end 2026-08-06
 
 ### 익일 오전 08:00 확정 데이터 저장
 
-다음 작업은 KRX OPEN API 데이터가 갱신되는 익일 오전 08:00에 직전일의 NXT 종목별 확정 누적값, KRX 종목·지수 확정값, KOSPI200 선물 최근월물 값, KOSPI200·KOSDAQ150 구성종목과 NXT 상·하한가 최초 도달시각을 `history.db`에 저장합니다. 첫 실행에 실패하면 1분 간격으로 최대 10회 자동 재시도합니다. 실행을 놓쳤으면 마지막 확정 저장일 다음 날부터 누락분을 보충하며, 휴장일은 저장하지 않습니다.
+다음 작업은 KRX OPEN API 데이터가 갱신되는 익일 오전 08:00에 직전일의 NXT 종목별 확정 누적값, KRX 종목·지수 확정값, KRX 전 상장주권 거래정보, KOSPI200 선물 최근월물 값, KOSPI200·KOSDAQ150 구성종목과 NXT 상·하한가 최초 도달시각을 저장합니다. 첫 실행에 실패하면 1분 간격으로 최대 10회 자동 재시도합니다. 실행을 놓쳤으면 마지막 확정 저장일 다음 날부터 누락분을 보충하며, 휴장일은 저장하지 않습니다.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register_daily_market_task.ps1

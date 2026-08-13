@@ -2267,6 +2267,27 @@ class HistoricalMarketStore:
             ).fetchall()
         return {date.fromisoformat(str(row["trade_date"])) for row in rows}
 
+    def index_constituent_codes(
+        self,
+        trading_date: date,
+    ) -> dict[str, set[str]]:
+        """기준일의 KOSPI200·KOSDAQ150 구성종목 단축코드를 반환합니다."""
+
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT index_name, stock_code
+                FROM krx_index_constituents
+                WHERE trade_date = ?
+                  AND index_name IN ('KOSPI200', 'KOSDAQ150')
+                """,
+                (trading_date.isoformat(),),
+            ).fetchall()
+        result = {"KOSPI200": set(), "KOSDAQ150": set()}
+        for row in rows:
+            result[str(row["index_name"])].add(str(row["stock_code"]))
+        return result
+
     def list_nxt_index_member_counts(
         self,
         start_date: date,

@@ -151,6 +151,10 @@ def test_store_counts_nxt_members_in_krx_representative_indices(tmp_path: Path) 
     assert stored == 3
     assert counts[trading_date] == {"KOSDAQ150": 1, "KOSPI200": 1}
     assert store.index_constituent_dates("KOSPI200") == {trading_date}
+    assert store.index_constituent_codes(trading_date) == {
+        "KOSPI200": {"005930", "999999"},
+        "KOSDAQ150": {"000660"},
+    }
 
 
 def test_historical_store_builds_reclassified_daily_eligibility(tmp_path: Path) -> None:
