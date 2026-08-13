@@ -10,11 +10,14 @@ from datetime import date, datetime, timedelta, timezone
 from html import escape
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import unquote
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import extra_streamlit_components as stx
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from src.analytics import (
     build_daily_metrics,
@@ -1434,6 +1437,171 @@ def _format_rate(value: object) -> str:
     return "-" if value is None else f"{float(value):.2%}"
 
 
+def _safe_ratio(numerator: object, denominator: object) -> float | None:
+    if numerator is None or denominator is None:
+        return None
+    try:
+        denominator_value = float(denominator)
+        if denominator_value <= 0:
+            return None
+        return float(numerator) / denominator_value
+    except (TypeError, ValueError):
+        return None
+
+
+def _comparison_display_frame(
+    rows: list[dict[str, object]],
+    market_totals: dict[str, object],
+    tradable_markets: dict[str, str],
+    unavailable_reasons: dict[str, str],
+) -> pd.DataFrame:
+    columns = [
+        "종목코드",
+        "종목명",
+        "NXT 현재가",
+        "등락률",
+        "괴리율",
+        "NXT 거래량",
+        "거래량비율",
+        "거래량기여도",
+        "NXT 거래대금",
+        "거래대금비율",
+        "거래대금기여도",
+        "시가총액",
+        "KRX 현재가",
+        "KRX 거래량",
+        "KRX 거래대금",
+        "거래가능시장",
+        "NXT 거래불가사유",
+    ]
+    display_rows = []
+    for row in rows:
+        symbol = str(row["종목코드"])
+        display_rows.append(
+            {
+                "종목코드": symbol,
+                "종목명": str(row["종목명"]),
+                "NXT 현재가": row["nxt_current_price"],
+                "등락률": row["change_rate"],
+                "괴리율": row["disparity_rate"],
+                "NXT 거래량": row["nxt_volume"],
+                "거래량비율": row["volume_ratio"],
+                "거래량기여도": _safe_ratio(
+                    row["nxt_volume"], market_totals["krx_volume"]
+                ),
+                "NXT 거래대금": row["nxt_amount"],
+                "거래대금비율": row["amount_ratio"],
+                "거래대금기여도": _safe_ratio(
+                    row["nxt_amount"], market_totals["krx_amount"]
+                ),
+                "시가총액": row["market_cap"],
+                "KRX 현재가": row["krx_current_price"],
+                "KRX 거래량": row["krx_volume"],
+                "KRX 거래대금": row["krx_amount"],
+                "거래가능시장": tradable_markets.get(symbol) or "-",
+                "NXT 거래불가사유": unavailable_reasons.get(symbol) or "-",
+            }
+        )
+    return pd.DataFrame(display_rows, columns=columns)
+
+
+def _excel_ready_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+    for column in result.columns:
+        if isinstance(result[column].dtype, pd.DatetimeTZDtype):
+            result[column] = result[column].dt.tz_convert("Asia/Seoul").dt.tz_localize(None)
+            continue
+        if result[column].dtype == "object":
+            result[column] = result[column].map(
+                lambda value: (
+                    value.tz_convert("Asia/Seoul").tz_localize(None)
+                    if isinstance(value, pd.Timestamp) and value.tzinfo is not None
+                    else value
+                )
+            )
+    return result
+
+
+def _excel_workbook_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    output = BytesIO()
+    used_names: set[str] = set()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for requested_name, source_frame in sheets.items():
+            base_name = re.sub(r"[\\/*?:\[\]]", "_", requested_name).strip()[:31] or "조회결과"
+            sheet_name = base_name
+            suffix = 2
+            while sheet_name in used_names:
+                suffix_text = f"_{suffix}"
+                sheet_name = f"{base_name[:31-len(suffix_text)]}{suffix_text}"
+                suffix += 1
+            used_names.add(sheet_name)
+            frame = _excel_ready_frame(source_frame)
+            frame.to_excel(writer, sheet_name=sheet_name, index=False)
+            worksheet = writer.book[sheet_name]
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="334155")
+            for column_number, column_name in enumerate(frame.columns, start=1):
+                column_letter = get_column_letter(column_number)
+                values = [str(column_name)] + [
+                    "" if pd.isna(value) else str(value)
+                    for value in frame.iloc[:, column_number - 1].head(500)
+                ]
+                worksheet.column_dimensions[column_letter].width = min(
+                    48,
+                    max(10, max(len(value) for value in values) + 2),
+                )
+                column_text = str(column_name)
+                for row_number in range(2, worksheet.max_row + 1):
+                    cell = worksheet.cell(row=row_number, column=column_number)
+                    raw_value = frame.iloc[row_number - 2, column_number - 1]
+                    if isinstance(raw_value, str) and raw_value.startswith(("http://", "https://")):
+                        cell.hyperlink = raw_value.split("#kind-title=", 1)[0]
+                        cell.style = "Hyperlink"
+                        if "#kind-title=" in raw_value:
+                            cell.value = unquote(raw_value.split("#kind-title=", 1)[1])
+                        elif "공시" in column_text or "원문" in column_text:
+                            cell.value = "원문 보기"
+                    if any(
+                        label in column_text
+                        for label in ("등락률", "괴리율", "비율", "기여도")
+                    ):
+                        cell.number_format = "0.00%"
+                    elif isinstance(raw_value, (date, datetime, pd.Timestamp)):
+                        cell.number_format = (
+                            "yyyy-mm-dd hh:mm:ss" if "일시" in column_text else "yyyy-mm-dd"
+                        )
+                    elif isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+                        cell.number_format = "#,##0.00" if isinstance(raw_value, float) else "#,##0"
+    return output.getvalue()
+
+
+def _render_excel_download(
+    sheets: dict[str, pd.DataFrame],
+    *,
+    file_name: str,
+    key: str,
+    label: str = "조회 결과 Excel 다운로드",
+) -> None:
+    available = {
+        name: frame.copy()
+        for name, frame in sheets.items()
+        if frame is not None and not frame.empty
+    }
+    workbook_data = _excel_workbook_bytes(available) if available else None
+    st.download_button(
+        label,
+        data=workbook_data or _excel_workbook_bytes({"조회결과": pd.DataFrame()}),
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=key,
+        use_container_width=True,
+        disabled=not available,
+    )
+
+
 def _format_volume_with_eok(value: object) -> str:
     volume = int(value or 0)
     return f"{volume:,} ({volume / 100_000_000:,.2f}억주)"
@@ -1973,6 +2141,10 @@ def _render_dashboard_notices(*, historical: bool) -> None:
                 "외국주권·DR은 포함하지 않습니다."
             ),
             "과거 시가총액은 KRX OPEN API가 제공하는 확정값입니다.",
+            (
+                "기여도는 해당 종목 NXT 거래량·거래대금을 시장 전체 KRX 거래량·거래대금으로 "
+                "나눈 값이며, 종목별 기여도의 합은 시장 전체 NXT/KRX 비율과 같습니다."
+            ),
             "지수·선물·환율은 제공처와 갱신 시각이 달라 같은 시점의 값이 아닐 수 있습니다.",
         ]
     else:
@@ -2164,44 +2336,12 @@ def _render_rest_universe_table(
         ),
         reverse=True,
     )
-    display_rows = [
-        {
-            "종목코드": str(row["종목코드"]),
-            "종목명": str(row["종목명"]),
-            "NXT 현재가": row["nxt_current_price"],
-            "등락률": row["change_rate"],
-            "괴리율": row["disparity_rate"],
-            "NXT 거래량": row["nxt_volume"],
-            "거래량비율": row["volume_ratio"],
-            "NXT 거래대금": row["nxt_amount"],
-            "거래대금비율": row["amount_ratio"],
-            "시가총액": row["market_cap"],
-            "KRX 현재가": row["krx_current_price"],
-            "KRX 거래량": row["krx_volume"],
-            "KRX 거래대금": row["krx_amount"],
-            "거래가능시장": tradable_markets.get(str(row["종목코드"])) or "-",
-            "NXT 거래불가사유": unavailable_reasons.get(str(row["종목코드"])) or "-",
-        }
-        for row in rows
-    ]
-    display_columns = [
-        "종목코드",
-        "종목명",
-        "NXT 현재가",
-        "등락률",
-        "괴리율",
-        "NXT 거래량",
-        "거래량비율",
-        "NXT 거래대금",
-        "거래대금비율",
-        "시가총액",
-        "KRX 현재가",
-        "KRX 거래량",
-        "KRX 거래대금",
-        "거래가능시장",
-        "NXT 거래불가사유",
-    ]
-    display_frame = pd.DataFrame(display_rows, columns=display_columns)
+    display_frame = _comparison_display_frame(
+        rows,
+        market_totals,
+        tradable_markets,
+        unavailable_reasons,
+    )
     price_columns = [
         "NXT 현재가",
         "NXT 거래량",
@@ -2211,7 +2351,14 @@ def _render_rest_universe_table(
         "KRX 거래량",
         "KRX 거래대금",
     ]
-    rate_columns = ["등락률", "괴리율", "거래량비율", "거래대금비율"]
+    rate_columns = [
+        "등락률",
+        "괴리율",
+        "거래량비율",
+        "거래량기여도",
+        "거래대금비율",
+        "거래대금기여도",
+    ]
     right_aligned_columns = price_columns + rate_columns
     display_table = (
         display_frame.style.format(
@@ -2420,9 +2567,8 @@ def _render_historical_nxt_dashboard(
         '<div class="dashboard-section-gap" aria-hidden="true"></div>',
         unsafe_allow_html=True,
     )
-    _render_market_totals(
-        _historical_market_totals(statuses, quotes, krx_snapshot)
-    )
+    market_totals = _historical_market_totals(statuses, quotes, krx_snapshot)
+    _render_market_totals(market_totals)
 
     st.markdown(
         '<div class="dashboard-table-gap" aria-hidden="true"></div>',
@@ -2459,44 +2605,12 @@ def _render_historical_nxt_dashboard(
         ),
         reverse=True,
     )
-    display_rows = [
-        {
-            "종목코드": str(row["종목코드"]),
-            "종목명": str(row["종목명"]),
-            "NXT 현재가": row["nxt_current_price"],
-            "등락률": row["change_rate"],
-            "괴리율": row["disparity_rate"],
-            "NXT 거래량": row["nxt_volume"],
-            "거래량비율": row["volume_ratio"],
-            "NXT 거래대금": row["nxt_amount"],
-            "거래대금비율": row["amount_ratio"],
-            "시가총액": row["market_cap"],
-            "KRX 현재가": row["krx_current_price"],
-            "KRX 거래량": row["krx_volume"],
-            "KRX 거래대금": row["krx_amount"],
-            "거래가능시장": tradable_markets.get(str(row["종목코드"])) or "-",
-            "NXT 거래불가사유": unavailable_reasons.get(str(row["종목코드"])) or "-",
-        }
-        for row in rows
-    ]
-    display_columns = [
-        "종목코드",
-        "종목명",
-        "NXT 현재가",
-        "등락률",
-        "괴리율",
-        "NXT 거래량",
-        "거래량비율",
-        "NXT 거래대금",
-        "거래대금비율",
-        "시가총액",
-        "KRX 현재가",
-        "KRX 거래량",
-        "KRX 거래대금",
-        "거래가능시장",
-        "NXT 거래불가사유",
-    ]
-    display_frame = pd.DataFrame(display_rows, columns=display_columns)
+    display_frame = _comparison_display_frame(
+        rows,
+        market_totals,
+        tradable_markets,
+        unavailable_reasons,
+    )
     price_columns = [
         "NXT 현재가",
         "NXT 거래량",
@@ -2506,7 +2620,14 @@ def _render_historical_nxt_dashboard(
         "KRX 거래량",
         "KRX 거래대금",
     ]
-    rate_columns = ["등락률", "괴리율", "거래량비율", "거래대금비율"]
+    rate_columns = [
+        "등락률",
+        "괴리율",
+        "거래량비율",
+        "거래량기여도",
+        "거래대금비율",
+        "거래대금기여도",
+    ]
     display_table = (
         display_frame.style.format(
             {
@@ -2547,6 +2668,11 @@ def _render_historical_nxt_dashboard(
             "거래가능시장": st.column_config.TextColumn(width="small"),
             "NXT 거래불가사유": st.column_config.TextColumn(width="medium"),
         },
+    )
+    _render_excel_download(
+        {"NXT 종목별 현황": display_frame},
+        file_name=f"NXT_DASHBOARD_{status_date:%Y%m%d}.xlsx",
+        key=f"download_historical_nxt_dashboard_{status_date:%Y%m%d}",
     )
     _render_dashboard_notices(historical=True)
 
@@ -3052,6 +3178,11 @@ def market_history_page() -> None:
         )
     )
     st.dataframe(table, hide_index=True, use_container_width=True, height=700)
+    _render_excel_download(
+        {"일별 데이터": frame.sort_values("일자", ascending=False)},
+        file_name=f"NXT_KRX_일별거래추이_{start_date:%Y%m%d}_{end_date:%Y%m%d}.xlsx",
+        key="download_market_history",
+    )
     _render_notice_items(
         [
             "이 화면은 외부 API를 호출하지 않고 SQLite에 저장된 값만 조회합니다.",
@@ -3097,34 +3228,32 @@ def _krx_listed_daily_frame(
     )
 
 
-def _krx_listed_excel_bytes(frame: pd.DataFrame, trading_date: date) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        frame.to_excel(writer, sheet_name=f"KRX_{trading_date:%Y%m%d}", index=False)
-        worksheet = writer.book[f"KRX_{trading_date:%Y%m%d}"]
-        worksheet.freeze_panes = "A2"
-        worksheet.auto_filter.ref = worksheet.dimensions
-        widths = {
-            "A": 16,
-            "B": 12,
-            "C": 24,
-            "D": 12,
-            "E": 14,
-            "F": 14,
-            "G": 18,
-            "H": 13,
-            "I": 18,
-            "J": 22,
-            "K": 10,
-            "L": 10,
+def _krx_listed_count_frame(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=[column, "종목수", "비중"])
+    counts = frame[column].fillna("미분류").replace("", "미분류").value_counts()
+    return pd.DataFrame(
+        {
+            column: counts.index,
+            "종목수": counts.values,
+            "비중": counts.values / int(counts.sum()),
         }
-        for column, width in widths.items():
-            worksheet.column_dimensions[column].width = width
-        for row in range(2, worksheet.max_row + 1):
-            worksheet[f"H{row}"].number_format = "yyyy-mm-dd"
-            for column in ("G", "I", "J"):
-                worksheet[f"{column}{row}"].number_format = "#,##0"
-    return output.getvalue()
+    )
+
+
+def _krx_listed_excel_bytes(
+    frame: pd.DataFrame,
+    trading_date: date,
+    *,
+    security_counts: pd.DataFrame | None = None,
+    stock_type_counts: pd.DataFrame | None = None,
+) -> bytes:
+    sheets = {f"KRX_{trading_date:%Y%m%d}": frame}
+    if security_counts is not None:
+        sheets["증권구분별 종목수"] = security_counts
+    if stock_type_counts is not None:
+        sheets["주식종류별 종목수"] = stock_type_counts
+    return _excel_workbook_bytes(sheets)
 
 
 def krx_listed_history_page() -> None:
@@ -3239,6 +3368,26 @@ def krx_listed_history_page() -> None:
         f"{int((filtered['Q150'] == 'Y').sum()):,}",
     )
 
+    security_counts = _krx_listed_count_frame(filtered, "증권구분")
+    stock_type_counts = _krx_listed_count_frame(filtered, "주식종류")
+    count_columns = st.columns(2)
+    with count_columns[0]:
+        st.markdown("##### 증권구분별 종목수")
+        st.dataframe(
+            security_counts.style.format({"종목수": "{:,.0f}", "비중": "{:.2%}"}),
+            hide_index=True,
+            use_container_width=True,
+            height=min(280, 38 + len(security_counts) * 35),
+        )
+    with count_columns[1]:
+        st.markdown("##### 주식종류별 종목수")
+        st.dataframe(
+            stock_type_counts.style.format({"종목수": "{:,.0f}", "비중": "{:.2%}"}),
+            hide_index=True,
+            use_container_width=True,
+            height=min(280, 38 + len(stock_type_counts) * 35),
+        )
+
     table = (
         filtered.style.format(
             {
@@ -3267,7 +3416,12 @@ def krx_listed_history_page() -> None:
     st.dataframe(table, hide_index=True, use_container_width=True, height=720)
     st.download_button(
         "조회 결과 Excel 다운로드",
-        data=_krx_listed_excel_bytes(filtered, selected_date),
+        data=_krx_listed_excel_bytes(
+            filtered,
+            selected_date,
+            security_counts=security_counts,
+            stock_type_counts=stock_type_counts,
+        ),
         file_name=f"KRX_전체상장종목_{selected_date:%Y%m%d}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
@@ -3278,6 +3432,10 @@ def krx_listed_history_page() -> None:
             (
                 "대상은 KRX OPEN API의 KOSPI·KOSDAQ 주식 일별매매정보와 종목기본정보에 "
                 "수록된 종목이며 코넥스·ETF·ETN·ELW는 제외합니다."
+            ),
+            (
+                "기여도는 해당 종목 NXT 거래량·거래대금을 시장 전체 KRX 거래량·거래대금으로 "
+                "나눈 값이며, 종목별 기여도의 합은 시장 전체 NXT/KRX 비율과 같습니다."
             ),
             (
                 "KRX 거래량·거래대금은 해당 종목의 거래소 확정 일별 값입니다. "
@@ -4218,6 +4376,48 @@ def _render_nxt_limit_proximity_table(proximity_rows: pd.DataFrame) -> None:
     )
 
 
+def _nxt_limit_proximity_export_frame(proximity_rows: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "종목코드",
+        "종목명",
+        "상장시장",
+        "기준가격",
+        "상한가",
+        "하한가",
+        "시가",
+        "최근접가격",
+        "상·하한가 근접 구분",
+        "도달시점",
+        "잔여틱",
+        "종가",
+    ]
+    if proximity_rows.empty:
+        return pd.DataFrame(columns=columns)
+    result = proximity_rows.copy()
+    result["근접구분순서"] = result["근접구분"].map({"상한가": 0, "하한가": 1})
+    result["근접시점순서"] = result["근접시점"].map(
+        lambda value: (
+            "0000"
+            if value == "시가"
+            else str(value).replace(":", "")
+            if re.fullmatch(r"\d{2}:\d{2}", str(value))
+            else "9999"
+        )
+    )
+    result = result.sort_values(
+        ["근접구분순서", "잔여틱", "근접시점순서", "종목코드"],
+        ascending=[True, True, True, True],
+    )
+    distances = pd.to_numeric(result["잔여틱"], errors="coerce").fillna(0).astype(int)
+    result["상·하한가 근접 구분"] = [
+        direction if distance == 0 else f"{direction} 근접"
+        for direction, distance in zip(result["근접구분"], distances)
+    ]
+    result["도달시점"] = result["근접시점"]
+    result["잔여틱"] = distances
+    return result[columns].reset_index(drop=True)
+
+
 def _render_nxt_limit_proximity_result(
     frame: pd.DataFrame,
     *,
@@ -4258,11 +4458,16 @@ def _render_nxt_limit_proximity_result(
         ]
 
     filtered_symbols = set(filtered["종목코드"].astype(str))
-    _render_nxt_limit_proximity_table(
-        proximity_rows[
-            proximity_rows["종목코드"].astype(str).isin(filtered_symbols)
-        ]
-    )
+    filtered_proximity_rows = proximity_rows[
+        proximity_rows["종목코드"].astype(str).isin(filtered_symbols)
+    ]
+    _render_nxt_limit_proximity_table(filtered_proximity_rows)
+    if not live:
+        _render_excel_download(
+            {"상하한가 근접 종목": _nxt_limit_proximity_export_frame(filtered_proximity_rows)},
+            file_name=f"NXT_상하한가근접_{selected_date:%Y%m%d}.xlsx",
+            key=f"download_nxt_proximity_daily_{selected_date:%Y%m%d}",
+        )
 
 
 def _render_nxt_limit_proximity_notice() -> None:
@@ -4674,6 +4879,13 @@ def disclosure_page() -> None:
     )
 
     _render_disclosure_table(frame)
+    _render_excel_download(
+        {"KRX 시장조치 공시": frame},
+        file_name=(
+            f"KRX_시장조치_{query_start_date:%Y%m%d}_{query_end_date:%Y%m%d}.xlsx"
+        ),
+        key="download_disclosure_results",
+    )
     if SHOW_CHARTS and query_all_categories and not frame.empty:
         counts = (
             frame.groupby("구분")["종목코드"]
@@ -4987,6 +5199,16 @@ def nxt_changes_page() -> None:
                     )
                 },
             )
+
+    _render_excel_download(
+        {
+            "일별 집계": summary_frame,
+            "종목별 변동내역": change_frame,
+            "거래불가 현황": unavailable_frame,
+        },
+        file_name=f"NXT_종목변동내역_{start_date:%Y%m%d}_{end_date:%Y%m%d}.xlsx",
+        key="download_nxt_changes",
+    )
 
     if SHOW_CHARTS:
         flow_chart = px.bar(
