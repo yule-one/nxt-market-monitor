@@ -255,10 +255,12 @@ class HistoricalMarketStore:
                     shutil.copyfileobj(source, target)
             seed_counts = self._database_table_counts(temporary_path)
             current_counts = self._database_table_counts(self.path)
+            seed_snapshot_dates = self._database_snapshot_dates(temporary_path)
+            current_snapshot_dates = self._database_snapshot_dates(self.path)
             current_is_complete = bool(seed_counts) and bool(current_counts) and all(
                 current_counts.get(table_name, 0) >= seed_count
                 for table_name, seed_count in seed_counts.items()
-            )
+            ) and seed_snapshot_dates.issubset(current_snapshot_dates)
             if current_is_complete:
                 return
             if self.path.exists():
@@ -302,6 +304,35 @@ class HistoricalMarketStore:
                 connection.close()
         except sqlite3.Error:
             return {}
+
+    @staticmethod
+    def _database_snapshot_dates(path: Path) -> set[str]:
+        if not path.exists():
+            return set()
+        try:
+            connection = sqlite3.connect(
+                f"file:{path.resolve().as_posix()}?mode=ro",
+                uri=True,
+                timeout=5,
+            )
+            try:
+                exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='daily_market_metrics'"
+                ).fetchone()
+                if exists is None:
+                    return set()
+                return {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT trade_date FROM daily_market_metrics "
+                        "WHERE is_final = 1"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            return set()
 
     def _replace_database_from_snapshot(self, snapshot_path: Path) -> None:
         source = sqlite3.connect(snapshot_path, timeout=30)
