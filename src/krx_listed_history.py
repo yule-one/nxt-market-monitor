@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from src.krx_openapi import KrxListedSecurityDaily
+from src.seed_distribution import resolve_deployed_seed
 
 
 @dataclass(frozen=True)
@@ -49,13 +50,17 @@ class KrxListedHistoryStore:
     ) -> None:
         project_root = Path(__file__).resolve().parents[1]
         self.path = path or project_root / "data" / "krx_listed_history.db"
-        self.seed_path = (
-            seed_path
-            if seed_path is not None
-            else project_root / "data" / "krx_listed_history.db.gz"
-            if path is None
-            else None
-        )
+        if seed_path is not None:
+            self.seed_path = seed_path
+        elif path is None:
+            bundled_seed = project_root / "data" / "krx_listed_history.db.gz"
+            self.seed_path = resolve_deployed_seed(
+                project_root,
+                bundled_seed,
+                "krx_listed_history",
+            )
+        else:
+            self.seed_path = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._restore_seed_if_needed()
         self._lock = threading.RLock()

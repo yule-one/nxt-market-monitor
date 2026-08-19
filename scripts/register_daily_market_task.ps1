@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$syncScript = Join-Path $projectRoot "scripts\sync_daily_market.py"
+$syncScript = Join-Path $projectRoot "scripts\run_daily_market_pipeline.py"
 $pythonPath = (Get-Command python -ErrorAction Stop).Source
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
@@ -30,7 +30,7 @@ Register-ScheduledTask `
     -Trigger $trigger `
     -Settings $settings `
     -Principal $principal `
-    -Description "Save previous-day NXT/KRX all listed stocks/TMI, KOSPI200 futures, USD-KRW, and NXT pre-market OHLC at 08:00; retry up to 10 times every minute" `
+    -Description "Save previous-day NXT/KRX data at 08:00, publish verified DB seeds to GitHub Release, and trigger Streamlit deployment; retry up to 10 times every minute" `
     -Force | Out-Null
 
 $task = Get-ScheduledTask -TaskName $TaskName

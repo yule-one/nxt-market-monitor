@@ -199,6 +199,8 @@ python scripts\backfill_nxt_premarket.py --start 2026-08-06 --end 2026-08-06
 
 다음 작업은 KRX OPEN API 데이터가 갱신되는 익일 오전 08:00에 직전일의 NXT 종목별 확정 누적값, KRX 종목·지수 확정값, KRX 전 상장주권 거래정보, KOSPI200 선물 최근월물 값, KOSPI200·KOSDAQ150 구성종목과 NXT 상·하한가 최초 도달시각을 저장합니다. 첫 실행에 실패하면 1분 간격으로 최대 10회 자동 재시도합니다. 실행을 놓쳤으면 마지막 확정 저장일 다음 날부터 누락분을 보충하며, 휴장일은 저장하지 않습니다.
 
+적재가 성공하면 두 배포 DB를 무결성 검사 후 압축해 GitHub Release의 `daily-market-data` 자산으로 교체하고, 날짜·크기·SHA-256 해시를 담은 `data/daily_seed_manifest.json`만 `main`에 커밋합니다. 이 작은 커밋이 Streamlit 재배포를 시작하며, 새 앱 인스턴스는 manifest의 해시를 검증한 최신 Release DB를 내려받습니다. 전체 DB를 매일 Git 이력에 추가하지 않으므로 저장소 용량 증가를 억제합니다. GitHub 인증이나 업로드·푸시에 실패하면 작업이 실패 상태로 끝나 예약 작업의 1분 간격 재시도 대상이 됩니다.
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register_daily_market_task.ps1
 ```
