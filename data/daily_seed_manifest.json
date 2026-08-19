@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "latest_trade_date": "2026-08-18",
+  "published_at": "2026-08-19T11:15:39+09:00",
+  "release_tag": "daily-market-data",
+  "assets": {
+    "history": {
+      "name": "history.db.gz",
+      "url": "https://github.com/yule-one/nxt-market-monitor/releases/download/daily-market-data/history.db.gz",
+      "sha256": "13f5cba162fbfcb07ea97635cd325d5956ad5f69e9f37e313214fb422b71614e",
+      "size": 30758839
+    },
+    "krx_listed_history": {
+      "name": "krx_listed_history.db.gz",
+      "url": "https://github.com/yule-one/nxt-market-monitor/releases/download/daily-market-data/krx_listed_history.db.gz",
+      "sha256": "4224cba18606a9b135cc281218ca7867e72befceae01865f384c3e8ac7dc5679",
+      "size": 59694856
+    }
+  }
+}
