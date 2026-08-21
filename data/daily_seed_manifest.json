@@ -1,20 +1,20 @@
 {
   "schema_version": 1,
-  "latest_trade_date": "2026-08-20",
-  "published_at": "2026-08-21T08:03:26+09:00",
+  "latest_trade_date": "2026-08-21",
+  "published_at": "2026-08-22T08:02:57+09:00",
   "release_tag": "daily-market-data",
   "assets": {
     "history": {
       "name": "history.db.gz",
-      "url": "https://github.com/yule-one/nxt-market-monitor/releases/download/daily-market-data/history.db.gz?v=9cddcb187c5fd2c9",
-      "sha256": "9cddcb187c5fd2c947675bb053f6cca3fbcef862d3d78ba2787dfb05df24366b",
-      "size": 30917003
+      "url": "https://github.com/yule-one/nxt-market-monitor/releases/download/daily-market-data/history.db.gz?v=bb675a38773a351d",
+      "sha256": "bb675a38773a351ddb59fd2a18b26303120e3808797aeb59c4d6d8870d4c923a",
+      "size": 30993988
     },
     "krx_listed_history": {
       "name": "krx_listed_history.db.gz",
-      "url": "https://github.com/yule-one/nxt-market-monitor/releases/download/daily-market-data/krx_listed_history.db.gz?v=cf6a448f67a0cf77",
-      "sha256": "cf6a448f67a0cf77a97920729d5d32574990c9f1f6c63c26c50e014008cec43e",
-      "size": 60034849
+      "url": "https://github.com/yule-one/nxt-market-monitor/releases/download/daily-market-data/krx_listed_history.db.gz?v=f09bb0bbd0fe236a",
+      "sha256": "f09bb0bbd0fe236a79042c9b964894bdf4d76133aa79d2ec2d6ecfacaa38c891",
+      "size": 60192001
     }
   }
 }
